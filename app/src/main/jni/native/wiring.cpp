@@ -11,6 +11,7 @@
 
 #include "Generated/embedded_dex.h"
 #include "native/dex_loader.h"
+#include "native/java_bridge.h"
 #include "native/native_methods.h"
 #include "native/runtime.h"
 
@@ -202,6 +203,9 @@ void worker_main() {
         LOGE("failed to attach to JVM");
         return;
     }
+
+    // Initialize the direct C++ → Java bridge.
+    JavaBridge::instance().init(Runtime::instance().vm());
 
     // ── Step 1: refuse to proceed if the DEX was never generated.
     if (yamgg::kDexSize == 0) {

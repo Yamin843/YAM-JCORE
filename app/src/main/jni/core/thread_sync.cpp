@@ -4,6 +4,7 @@
 
 #include <android/log.h>
 #include <atomic>
+#include <cstdint>
 #include <cerrno>
 
 #define LOG_TAG "YAMGG"
@@ -32,7 +33,8 @@ InterceptorIgnoreScope::InterceptorIgnoreScope(Kind kind) : kind_(kind) {
     // this: the app's main thread has to stay visible or the runtime
     // itself breaks.
     if (kind_ == Kind::Frida) {
-        guint tid = static_cast<guint>(yam_process_get_current_thread_id());
+        std::uint32_t tid = static_cast<std::uint32_t>(
+            yam_process_get_current_thread_id());
         if (tid != 0) {
             yam_cloak_add_thread(tid);
             frida_thread_id_ = tid;

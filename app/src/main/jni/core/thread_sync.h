@@ -19,6 +19,7 @@
 #define YAMGG_CORE_THREAD_SYNC_H
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -51,7 +52,7 @@ public:
 private:
     void* interceptor_ = nullptr;
     Kind  kind_;
-    guint frida_thread_id_ = 0;
+    std::uint32_t frida_thread_id_ = 0;
 };
 
 // RAII wrapper that preserves errno across a block, because ART and V8

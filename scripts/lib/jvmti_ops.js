@@ -104,3 +104,36 @@ handlers["bridge.deoptimize.boot_image"] = function () {
     });
     return { ok: true, scope: "boot_image" };
 };
+
+// ─── bridge.deoptimize.method ───────────────────────────────────
+// Deoptimizes a single method. Pass className + methodName +
+// overloadTypes (optional). This is less disruptive than
+// deoptimizeEverything.
+handlers["bridge.deoptimize.method"] = function (args) {
+    if (!bridgeInfo.available) throw new Error("bridge unavailable");
+    if (!args || !args.className) throw new Error("className required");
+    if (!args.methodName) throw new Error("methodName required");
+    if (bridgeInfo.apiLevel < 24) {
+        throw new Error("deoptimizeMethod requires API 24+");
+    }
+
+    var className     = args.className;
+    var methodName    = args.methodName;
+    var overloadTypes = args.overloadTypes || [];
+
+    var result = { ok: false };
+    Java.performNow(function () {
+        var C = Java.use(className);
+        var dispatcher = C[methodName];
+        if (!dispatcher) throw new Error("method not found: " + className + "." + methodName);
+        var method = dispatcher;
+        if (overloadTypes.length > 0) {
+            method = dispatcher.overload.apply(dispatcher, overloadTypes);
+        }
+        Java.deoptimizeMethod(method);
+        result.ok = true;
+    });
+
+    return result;
+};
+
