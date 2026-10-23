@@ -505,7 +505,6 @@ void ClassBrowserTab::toggle_trace(const bridge::MethodSignature& m) {
     }
     state.hook_id    = hook_id;
     state.active     = true;
-    state.call_count = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════

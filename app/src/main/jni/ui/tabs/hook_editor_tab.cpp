@@ -7,8 +7,6 @@
 #include "core/thread_sync.h"
 #include "imgui.h"
 
-namespace yamgg {
-
 namespace {
 
 // Human-friendly formatting for a JSON value coming from toJsonSafe().
