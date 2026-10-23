@@ -10,6 +10,7 @@
 #include "ui/main_window.h"
 #include "ui/tabs/call_panel_tab.h"
 #include "ui/tabs/hook_editor_tab.h"
+#include "art/heap_scanner.h"
 
 namespace yamgg {
 
@@ -160,6 +161,9 @@ void ClassBrowserTab::draw() {
     if (std::strcmp(filter_buf_, last_filter_.c_str()) != 0 && !list_.loading) {
         refresh_list();
     }
+
+    // ── Global method search bar ────────────────────────────
+    draw_method_search_section();
 
     // ── Top toolbar ──
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 120.0f);
@@ -320,6 +324,199 @@ void ClassBrowserTab::draw_details() {
     if (insp.constructors.empty() && insp.methods.empty() && insp.fields.empty()) {
         ImGui::TextDisabled("(no members visible via Java.use)");
     }
+
+    // Instance search lives at the bottom of the details panel so it
+    // always refers to the currently selected class.
+    draw_instance_search_section();
+}
+
+
+
+// ═══════════════════════════════════════════════════════════════
+//  Instance search (heap.choose via strategy)
+// ═══════════════════════════════════════════════════════════════
+
+void ClassBrowserTab::start_instance_search() {
+    if (detail_.class_name.empty() || instance_search_.running) return;
+
+    instance_search_.running       = true;
+    instance_search_.total_matches = 0;
+    instance_search_.error.clear();
+    instance_search_.matches.clear();
+    instance_search_.started = std::chrono::steady_clock::now();
+
+    art::ChooseStrategy strategy = art::ChooseStrategy::Auto;
+    if (instance_search_.strategy == 1) strategy = art::ChooseStrategy::Jvmti;
+    if (instance_search_.strategy == 2) strategy = art::ChooseStrategy::Jvmti;  // GetInstances falls back to JVMTI
+
+    std::string error;
+    uint64_t id = art::HeapScanner::instance().choose(
+        detail_.class_name,
+        [this](const art::HeapMatch& m) {
+            marshal_to_ui([this, m]() {
+                instance_search_.total_matches++;
+                InstanceSearchState::Match rec;
+                rec.handle  = m.handle;
+                rec.display = m.stringRep;
+                instance_search_.matches.push_back(std::move(rec));
+            });
+        },
+        [this](uint64_t /*id*/, bool /*aborted*/) {
+            marshal_to_ui([this]() {
+                instance_search_.running = false;
+            });
+        },
+        error,
+        10000,
+        strategy);
+
+    if (id == 0) {
+        instance_search_.running = false;
+        instance_search_.error   = error;
+    } else {
+        instance_search_.session_id = id;
+    }
+}
+
+void ClassBrowserTab::stop_instance_search() {
+    if (!instance_search_.running || instance_search_.session_id == 0) return;
+    art::HeapScanner::instance().cancel(instance_search_.session_id);
+    instance_search_.session_id = 0;
+}
+
+void ClassBrowserTab::draw_instance_search_section() {
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f),
+                       "Instance search — %s", detail_.class_name.c_str());
+
+    // Strategy dropdown.
+    const char* strategies[] = { "Auto", "JVMTI", "GetInstances" };
+    ImGui::SetNextItemWidth(180.0f);
+    ImGui::Combo("##strategy", &instance_search_.strategy,
+                 strategies, IM_ARRAYSIZE(strategies));
+
+    ImGui::SameLine();
+
+    if (instance_search_.running) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - instance_search_.started).count();
+        ImGui::TextDisabled("searching… %d found, %llds",
+                            instance_search_.total_matches, (long long)elapsed);
+        ImGui::SameLine();
+        if (ImGui::Button("Stop")) stop_instance_search();
+    } else {
+        if (ImGui::Button("Find instances")) start_instance_search();
+    }
+
+    if (!instance_search_.error.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "error: %s",
+                           instance_search_.error.c_str());
+    }
+
+    if (!instance_search_.matches.empty()) {
+        ImGui::BeginChild("##instance_results",
+                          ImVec2(0, 240), ImGuiChildFlags_Border);
+        for (size_t i = 0; i < instance_search_.matches.size(); i++) {
+            const auto& m = instance_search_.matches[i];
+            ImGui::PushID((int)i);
+
+            // Wrap in a selectable so the user can highlight one for
+            // hooking/calling from the other tabs.
+            std::string label = m.display.empty()
+                ? m.handle
+                : (m.display + "  [" + m.handle.substr(0, 12) + "…]");
+            if (ImGui::Selectable(label.c_str())) {
+                // Selecting a handle copies it to the "thisHandle" field
+                // of CallPanelTab so the user can invoke methods on it.
+                std::snprintf(CallPanelTab::instance().this_handle_buf_for_ui(),
+                              sizeof(CallPanelTab::instance().this_handle_buf_for_ui()),
+                              "%s", m.handle.c_str());
+                MainWindow::instance().select_tab(2);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Release")) {
+                std::string err;
+                bridge::HandleRegistry::instance().release(m.handle, err, 2000);
+                instance_search_.matches.erase(instance_search_.matches.begin() + i);
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Method search (Java.enumerateMethods)
+// ═══════════════════════════════════════════════════════════════
+
+void ClassBrowserTab::start_method_search() {
+    if (method_search_.running) return;
+    method_search_.running = true;
+    method_search_.error.clear();
+    method_search_.matches.clear();
+    method_search_.pattern = method_pattern_buf_;
+    method_search_.started = std::chrono::steady_clock::now();
+
+    MessageRouter::instance().post_command(
+        "bridge.class.enumerate_methods",
+        nlohmann::json{{"pattern", method_search_.pattern}},
+        [this](bool ok, const nlohmann::json& reply) {
+            marshal_to_ui([this, ok, reply]() {
+                method_search_.running = false;
+                if (!ok) {
+                    method_search_.error = reply.value("error", std::string("unknown"));
+                    return;
+                }
+                if (reply.contains("matches") && reply["matches"].is_array()) {
+                    for (const auto& m : reply["matches"]) {
+                        MethodSearchState::Match rec;
+                        rec.className  = m.value("className",  std::string());
+                        rec.methodName = m.value("methodName", std::string());
+                        rec.loader     = m.value("loader",     std::string());
+                        method_search_.matches.push_back(std::move(rec));
+                    }
+                }
+            });
+        });
+}
+
+void ClassBrowserTab::draw_method_search_section() {
+    ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f), "Global method search");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 220.0f);
+    ImGui::InputTextWithHint("##method_pattern",
+                             "pattern e.g. com.example.*!onCreate or *!*",
+                             method_pattern_buf_, sizeof(method_pattern_buf_));
+    ImGui::SameLine();
+    if (method_search_.running) {
+        ImGui::TextDisabled("searching…");
+    } else {
+        if (ImGui::Button("Search")) start_method_search();
+    }
+
+    if (!method_search_.error.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "error: %s",
+                           method_search_.error.c_str());
+    }
+
+    if (!method_search_.matches.empty()) {
+        if (ImGui::CollapsingHeader("Search results")) {
+            ImGui::BeginChild("##method_results", ImVec2(0, 180), ImGuiChildFlags_Border);
+            for (size_t i = 0; i < method_search_.matches.size(); i++) {
+                const auto& m = method_search_.matches[i];
+                ImGui::PushID((int)i);
+                std::string label = m.className + "." + m.methodName;
+                if (ImGui::Selectable(label.c_str())) {
+                    show_class(m.className);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+        }
+    }
+
+    ImGui::Separator();
 }
 
 } // namespace yamgg

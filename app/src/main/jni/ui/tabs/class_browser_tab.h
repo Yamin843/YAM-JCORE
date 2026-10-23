@@ -37,6 +37,46 @@ public:
 private:
     ClassBrowserTab() = default;
 
+    // ── Instance search (heap.choose) ───────────────────────
+    struct InstanceSearchState {
+        bool                          running = false;
+        uint64_t                      session_id = 0;
+        int                           strategy = 0;   // 0=Auto, 1=JVMTI, 2=GetInstances
+        int                           total_matches = 0;
+        std::chrono::steady_clock::time_point started;
+        std::string                   error;
+        struct Match {
+            std::string handle;
+            std::string display;
+        };
+        std::vector<Match>            matches;
+    };
+    InstanceSearchState instance_search_;
+
+    void start_instance_search();
+    void stop_instance_search();
+
+    // ── Advanced method search (enumerateMethods) ───────────
+    struct MethodSearchState {
+        bool                          running = false;
+        std::string                   pattern;
+        std::chrono::steady_clock::time_point started;
+        std::string                   error;
+        struct Match {
+            std::string className;
+            std::string methodName;
+            std::string loader;
+        };
+        std::vector<Match>            matches;
+    };
+    MethodSearchState method_search_;
+    char              method_pattern_buf_[256] = "com.example.*!*";
+
+    void start_method_search();
+
+    void draw_instance_search_section();
+    void draw_method_search_section();
+
     struct ListState {
         bool        loading = false;
         std::string error;

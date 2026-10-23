@@ -232,3 +232,115 @@ handlers["heap.choose_jvmti"] = function (args) {
 
     return { started: true, sessionId: sessionId, strategy: "jvmti" };
 };
+
+// ─── heap.choose_getinstances ───────────────────────────────────
+//
+// Uses art::gc::Heap::GetInstances directly via the bridge's
+// public API. This is what the bridge does internally on Android
+// versions before API 31. It is significantly faster than
+// VisitObjects because ART's garbage collector maintains a per-class
+// instance list.
+//
+// The pattern matches frida-java-bridge's _chooseObjectsArtPreA12
+// (see the JS bundle the user provided):
+//
+//   1. Create VariableSizedHandleScope(JNIEnv)
+//   2. Borrow Handle<Class> from the wrapper
+//   3. Decode the global jclass to an ArtClass*
+//   4. newHandle(ArtClass*) inside the scope
+//   5. Create HandleVector
+//   6. Call GetInstances(artHeap, scope, classHandle, 0, vector)
+//   7. Convert each Handle<Object> to a global ref, then release
+handlers["heap.choose_getinstances"] = function (args) {
+    if (!args || !args.className) throw new Error("className required");
+    if (typeof args.sessionId !== "number") throw new Error("sessionId required");
+    if (!bridgeInfo.available) throw new Error("bridge unavailable");
+
+    var className = args.className;
+    var sessionId = args.sessionId;
+    var startedAt = Date.now();
+    var matchCount = 0;
+
+    Java.performNow(function () {
+        var api = Java.api;
+        if (!api) throw new Error("bridge API not available");
+        if (!api["art::gc::Heap::GetInstances"]) {
+            throw new Error("GetInstances unavailable on this device");
+        }
+        if (!api.VariableSizedHandleScope || !api.HandleVector) {
+            throw new Error("handle helpers not exposed by the bridge");
+        }
+
+        var env = Java.vm.getEnv();
+        var C   = Java.use(className);
+        var jklass = C.$h;   // global jclass
+
+        // Handle<Class>: borrowed through the wrapper's helper.
+        var classHandle = C.$borrowClassHandle(env);
+        try {
+            // Scope owns handles for the duration of the walk.
+            var scope = api.VariableSizedHandleScope.$new(env, Java.vm);
+            try {
+                // Convert global jclass → ArtClass* via the VM helper.
+                var artClass = api["art::JavaVMExt::DecodeGlobal"](
+                    api.vm, env.handle, jklass);
+                if (artClass.isNull()) {
+                    throw new Error("could not decode class handle");
+                }
+                var klassHandle = scope.newHandle(artClass);
+
+                // HandleVector holds the results.
+                var vector = api.HandleVector.$new();
+                try {
+                    api["art::gc::Heap::GetInstances"](
+                        api.artHeap, scope.handle, klassHandle, 0, vector.handle);
+
+                    var handles = vector.handles;
+                    for (var i = 0; i < handles.length; i++) {
+                        try {
+                            var objHandle = handles[i];
+                            var wrapper   = Java.cast(objHandle, C);
+                            var retained  = retainObject(wrapper, className);
+                            matchCount++;
+                            send({ type: "event", name: "heap.match",
+                                   payload: {
+                                       sessionId: sessionId,
+                                       className: className,
+                                       handle:    retained,
+                                       toString:  "<" + className + ">"
+                                   } });
+                            if (matchCount % 500 === 0) {
+                                send({ type: "event", name: "heap.progress",
+                                       payload: {
+                                           sessionId: sessionId,
+                                           className: className,
+                                           matches:   matchCount,
+                                           elapsedMs: Date.now() - startedAt
+                                       } });
+                            }
+                        } catch (e) {
+                            // Skip individual objects that fail to cast.
+                        }
+                    }
+                } finally {
+                    vector.$delete();
+                }
+            } finally {
+                scope.$delete();
+            }
+        } finally {
+            classHandle.unref(env);
+        }
+
+        send({ type: "event", name: "heap.complete",
+               payload: {
+                   sessionId: sessionId,
+                   className: className,
+                   matches:   matchCount,
+                   elapsedMs: Date.now() - startedAt,
+                   strategy:  "getinstances"
+               } });
+    });
+
+    return { started: true, sessionId: sessionId, strategy: "getinstances" };
+};

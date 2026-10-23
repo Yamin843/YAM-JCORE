@@ -18,6 +18,10 @@ CallPanelTab& CallPanelTab::instance() {
     return t;
 }
 
+char* CallPanelTab::this_handle_buf_for_ui() {
+    return this_handle_buf_;
+}
+
 void CallPanelTab::prepare_call(const std::string& class_name,
                                 const std::string& method_name,
                                 const std::vector<std::string>& argument_types,

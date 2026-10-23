@@ -101,3 +101,77 @@ handlers["bridge.class.inspect"] = function (args) {
     });
     return out;
 };
+
+// ─── bridge.class.enumerate_methods ─────────────────────────────
+//
+// Java.enumerateMethods is a bridge API that uses JVMTI or ART
+// VisitClasses to find methods matching a pattern, without loading
+// every class. Pattern format: "className!methodName"
+//   "*!*"                    → every method in every class
+//   "com.example.*!*"        → every method in com.example.*
+//   "*!onCreate"             → every onCreate method
+//   "com.example.Foo!bar"    → exact match
+//
+// Returns matches grouped by class loader.
+handlers["bridge.class.enumerate_methods"] = function (args) {
+    if (!args || !args.pattern) throw new Error("pattern required");
+    if (!bridgeInfo.available) throw new Error("bridge unavailable");
+
+    var pattern = String(args.pattern);
+    var include_signature = args.includeSignature ? true : false;
+    var ignore_case       = args.ignoreCase ? true : false;
+    var skip_system       = args.skipSystemClasses ? true : false;
+
+    var matches = [];
+    Java.performNow(function () {
+        var results = Java.enumerateMethods(
+            pattern
+            + (include_signature ? "/s" : "")
+            + (ignore_case       ? "/i" : "")
+            + (skip_system       ? "/u" : ""));
+        for (var i = 0; i < results.length; i++) {
+            var group = results[i];
+            var loaderHandle = null;
+            if (group.loader) {
+                try { loaderHandle = Java.retain(group.loader).$h.toString(); } catch (e) {}
+            }
+            for (var j = 0; j < group.classes.length; j++) {
+                var cls = group.classes[j];
+                for (var k = 0; k < cls.methods.length; k++) {
+                    matches.push({
+                        className:   cls.name,
+                        methodName:  cls.methods[k],
+                        loader:      loaderHandle,
+                        loaderDesc:  group.loader ? safeString(group.loader) : "<boot>"
+                    });
+                }
+            }
+        }
+    });
+
+    return { matches: matches, pattern: pattern };
+};
+
+// ─── bridge.classloaders.list ───────────────────────────────────
+//
+// Lists every class loader the runtime knows about. Useful for
+// finding classes that were loaded by a non-system loader (games,
+// dynamic feature modules, plugins).
+handlers["bridge.classloaders.list"] = function () {
+    if (!bridgeInfo.available) throw new Error("bridge unavailable");
+    var loaders = [];
+    Java.performNow(function () {
+        Java.enumerateClassLoaders({
+            onMatch: function (loader) {
+                var handle = null;
+                try { handle = Java.retain(loader).$h.toString(); } catch (e) {}
+                loaders.push({
+                    handle: handle,
+                    description: safeString(loader)
+                });
+            },
+            onComplete: function () {}
+        });
+    });
+    return { loaders: loaders };
+};

@@ -553,6 +553,41 @@ handlers["jvmti.get_class_methods"] = function (args) {
     return out;
 };
 
+// ─── bridge.deoptimize.* ────────────────────────────────────────
+//
+// Deoptimization forces ART to abandon optimized (JIT/AOT) code for
+// the affected methods and fall back to the interpreter. This is
+// CRITICAL for reliable hooking on modern Android: when a method has
+// been AOT-compiled, its callers may have inlined copies that our
+// Interceptor cannot see. Deoptimizing first makes .implementation
+// stable.
+//
+// The bridge exposes three deopt levels:
+//   deoptimizeEverything()   — the whole runtime (slow but safest)
+//   deoptimizeBootImage()    — only boot image classes
+//   deoptimizeMethod(m)      — a specific ArtMethod
+handlers["bridge.deoptimize.everything"] = function () {
+    if (!bridgeInfo.available) throw new Error("bridge unavailable");
+    if (bridgeInfo.apiLevel < 24) {
+        throw new Error("deoptimization requires API 24+");
+    }
+    Java.performNow(function () {
+        Java.deoptimizeEverything();
+    });
+    return { ok: true, scope: "everything" };
+};
+
+handlers["bridge.deoptimize.boot_image"] = function () {
+    if (!bridgeInfo.available) throw new Error("bridge unavailable");
+    if (bridgeInfo.apiLevel < 26) {
+        throw new Error("deoptimizeBootImage requires API 26+");
+    }
+    Java.performNow(function () {
+        Java.deoptimizeBootImage();
+    });
+    return { ok: true, scope: "boot_image" };
+};
+
 // ═══════════════════════════════════════════════════════════════════
 //  lib/heap_ops.js
 // ═══════════════════════════════════════════════════════════════════
@@ -792,6 +827,118 @@ handlers["heap.choose_jvmti"] = function (args) {
     return { started: true, sessionId: sessionId, strategy: "jvmti" };
 };
 
+// ─── heap.choose_getinstances ───────────────────────────────────
+//
+// Uses art::gc::Heap::GetInstances directly via the bridge's
+// public API. This is what the bridge does internally on Android
+// versions before API 31. It is significantly faster than
+// VisitObjects because ART's garbage collector maintains a per-class
+// instance list.
+//
+// The pattern matches frida-java-bridge's _chooseObjectsArtPreA12
+// (see the JS bundle the user provided):
+//
+//   1. Create VariableSizedHandleScope(JNIEnv)
+//   2. Borrow Handle<Class> from the wrapper
+//   3. Decode the global jclass to an ArtClass*
+//   4. newHandle(ArtClass*) inside the scope
+//   5. Create HandleVector
+//   6. Call GetInstances(artHeap, scope, classHandle, 0, vector)
+//   7. Convert each Handle<Object> to a global ref, then release
+handlers["heap.choose_getinstances"] = function (args) {
+    if (!args || !args.className) throw new Error("className required");
+    if (typeof args.sessionId !== "number") throw new Error("sessionId required");
+    if (!bridgeInfo.available) throw new Error("bridge unavailable");
+
+    var className = args.className;
+    var sessionId = args.sessionId;
+    var startedAt = Date.now();
+    var matchCount = 0;
+
+    Java.performNow(function () {
+        var api = Java.api;
+        if (!api) throw new Error("bridge API not available");
+        if (!api["art::gc::Heap::GetInstances"]) {
+            throw new Error("GetInstances unavailable on this device");
+        }
+        if (!api.VariableSizedHandleScope || !api.HandleVector) {
+            throw new Error("handle helpers not exposed by the bridge");
+        }
+
+        var env = Java.vm.getEnv();
+        var C   = Java.use(className);
+        var jklass = C.$h;   // global jclass
+
+        // Handle<Class>: borrowed through the wrapper's helper.
+        var classHandle = C.$borrowClassHandle(env);
+        try {
+            // Scope owns handles for the duration of the walk.
+            var scope = api.VariableSizedHandleScope.$new(env, Java.vm);
+            try {
+                // Convert global jclass → ArtClass* via the VM helper.
+                var artClass = api["art::JavaVMExt::DecodeGlobal"](
+                    api.vm, env.handle, jklass);
+                if (artClass.isNull()) {
+                    throw new Error("could not decode class handle");
+                }
+                var klassHandle = scope.newHandle(artClass);
+
+                // HandleVector holds the results.
+                var vector = api.HandleVector.$new();
+                try {
+                    api["art::gc::Heap::GetInstances"](
+                        api.artHeap, scope.handle, klassHandle, 0, vector.handle);
+
+                    var handles = vector.handles;
+                    for (var i = 0; i < handles.length; i++) {
+                        try {
+                            var objHandle = handles[i];
+                            var wrapper   = Java.cast(objHandle, C);
+                            var retained  = retainObject(wrapper, className);
+                            matchCount++;
+                            send({ type: "event", name: "heap.match",
+                                   payload: {
+                                       sessionId: sessionId,
+                                       className: className,
+                                       handle:    retained,
+                                       toString:  "<" + className + ">"
+                                   } });
+                            if (matchCount % 500 === 0) {
+                                send({ type: "event", name: "heap.progress",
+                                       payload: {
+                                           sessionId: sessionId,
+                                           className: className,
+                                           matches:   matchCount,
+                                           elapsedMs: Date.now() - startedAt
+                                       } });
+                            }
+                        } catch (e) {
+                            // Skip individual objects that fail to cast.
+                        }
+                    }
+                } finally {
+                    vector.$delete();
+                }
+            } finally {
+                scope.$delete();
+            }
+        } finally {
+            classHandle.unref(env);
+        }
+
+        send({ type: "event", name: "heap.complete",
+               payload: {
+                   sessionId: sessionId,
+                   className: className,
+                   matches:   matchCount,
+                   elapsedMs: Date.now() - startedAt,
+                   strategy:  "getinstances"
+               } });
+    });
+
+    return { started: true, sessionId: sessionId, strategy: "getinstances" };
+};
+
 // ═══════════════════════════════════════════════════════════════════
 //  lib/backtrace_ops.js
 // ═══════════════════════════════════════════════════════════════════
@@ -991,6 +1138,80 @@ handlers["bridge.class.inspect"] = function (args) {
         }
     });
     return out;
+};
+
+// ─── bridge.class.enumerate_methods ─────────────────────────────
+//
+// Java.enumerateMethods is a bridge API that uses JVMTI or ART
+// VisitClasses to find methods matching a pattern, without loading
+// every class. Pattern format: "className!methodName"
+//   "*!*"                    → every method in every class
+//   "com.example.*!*"        → every method in com.example.*
+//   "*!onCreate"             → every onCreate method
+//   "com.example.Foo!bar"    → exact match
+//
+// Returns matches grouped by class loader.
+handlers["bridge.class.enumerate_methods"] = function (args) {
+    if (!args || !args.pattern) throw new Error("pattern required");
+    if (!bridgeInfo.available) throw new Error("bridge unavailable");
+
+    var pattern = String(args.pattern);
+    var include_signature = args.includeSignature ? true : false;
+    var ignore_case       = args.ignoreCase ? true : false;
+    var skip_system       = args.skipSystemClasses ? true : false;
+
+    var matches = [];
+    Java.performNow(function () {
+        var results = Java.enumerateMethods(
+            pattern
+            + (include_signature ? "/s" : "")
+            + (ignore_case       ? "/i" : "")
+            + (skip_system       ? "/u" : ""));
+        for (var i = 0; i < results.length; i++) {
+            var group = results[i];
+            var loaderHandle = null;
+            if (group.loader) {
+                try { loaderHandle = Java.retain(group.loader).$h.toString(); } catch (e) {}
+            }
+            for (var j = 0; j < group.classes.length; j++) {
+                var cls = group.classes[j];
+                for (var k = 0; k < cls.methods.length; k++) {
+                    matches.push({
+                        className:   cls.name,
+                        methodName:  cls.methods[k],
+                        loader:      loaderHandle,
+                        loaderDesc:  group.loader ? safeString(group.loader) : "<boot>"
+                    });
+                }
+            }
+        }
+    });
+
+    return { matches: matches, pattern: pattern };
+};
+
+// ─── bridge.classloaders.list ───────────────────────────────────
+//
+// Lists every class loader the runtime knows about. Useful for
+// finding classes that were loaded by a non-system loader (games,
+// dynamic feature modules, plugins).
+handlers["bridge.classloaders.list"] = function () {
+    if (!bridgeInfo.available) throw new Error("bridge unavailable");
+    var loaders = [];
+    Java.performNow(function () {
+        Java.enumerateClassLoaders({
+            onMatch: function (loader) {
+                var handle = null;
+                try { handle = Java.retain(loader).$h.toString(); } catch (e) {}
+                loaders.push({
+                    handle: handle,
+                    description: safeString(loader)
+                });
+            },
+            onComplete: function () {}
+        });
+    });
+    return { loaders: loaders };
 };
 
 // ═══════════════════════════════════════════════════════════════════

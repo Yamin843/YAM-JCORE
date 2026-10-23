@@ -33,6 +33,14 @@ public:
                       const std::vector<std::string>& argument_types,
                       bool is_static);
 
+public:
+    // Exposes the this_handle buffer for other tabs (e.g. the class
+    // browser's instance search) to prefill it with a selected handle.
+    // Returns a pointer to the internal buffer with the size the
+    // caller expects for ImGui::InputText.
+    char* this_handle_buf_for_ui();
+    static constexpr size_t this_handle_buf_size() { return 64; }
+
 private:
     CallPanelTab() = default;
 

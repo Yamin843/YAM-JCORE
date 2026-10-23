@@ -69,3 +69,38 @@ handlers["jvmti.get_class_methods"] = function (args) {
     });
     return out;
 };
+
+// ─── bridge.deoptimize.* ────────────────────────────────────────
+//
+// Deoptimization forces ART to abandon optimized (JIT/AOT) code for
+// the affected methods and fall back to the interpreter. This is
+// CRITICAL for reliable hooking on modern Android: when a method has
+// been AOT-compiled, its callers may have inlined copies that our
+// Interceptor cannot see. Deoptimizing first makes .implementation
+// stable.
+//
+// The bridge exposes three deopt levels:
+//   deoptimizeEverything()   — the whole runtime (slow but safest)
+//   deoptimizeBootImage()    — only boot image classes
+//   deoptimizeMethod(m)      — a specific ArtMethod
+handlers["bridge.deoptimize.everything"] = function () {
+    if (!bridgeInfo.available) throw new Error("bridge unavailable");
+    if (bridgeInfo.apiLevel < 24) {
+        throw new Error("deoptimization requires API 24+");
+    }
+    Java.performNow(function () {
+        Java.deoptimizeEverything();
+    });
+    return { ok: true, scope: "everything" };
+};
+
+handlers["bridge.deoptimize.boot_image"] = function () {
+    if (!bridgeInfo.available) throw new Error("bridge unavailable");
+    if (bridgeInfo.apiLevel < 26) {
+        throw new Error("deoptimizeBootImage requires API 26+");
+    }
+    Java.performNow(function () {
+        Java.deoptimizeBootImage();
+    });
+    return { ok: true, scope: "boot_image" };
+};
