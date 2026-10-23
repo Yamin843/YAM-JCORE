@@ -1,11 +1,10 @@
-// app/build.gradle — Android application module for YAM-JCORE.
+// app/build.gradle — minimal configuration for building libyamgg.so.
 //
-// The module builds a single shared library (libyamgg.so) from the C++
-// sources in app/src/main/jni/, bundles it with the app's Java classes
-// compiled into an in-memory DEX, and produces an APK that can be
-// installed on a rooted device. On a rooted device the .so is dropped
-// into the target app's data directory by the injector (outside this
-// build), and the DEX inside it provides ModView at runtime.
+// The project produces a single shared library (libyamgg.so). It does
+// not need an APK, and it does not declare targets in defaultConfig
+// because the CMakeLists.txt already defines exactly one target named
+// "yamgg". Calling `gradle :app:externalNativeBuildDebug` builds that
+// target without invoking the APK packaging pipeline.
 
 plugins {
     id 'com.android.application'
@@ -14,7 +13,6 @@ plugins {
 android {
     namespace 'com.yamgg.modview'
     compileSdk 34
-    ndkVersion '25.2.9519653'
 
     defaultConfig {
         applicationId 'com.yamgg.modview'
@@ -23,26 +21,14 @@ android {
         versionCode 1
         versionName '1.0'
 
-        // Only ARM64 is targeted. ARMv7, x86, and x86_64 are not
-        // supported by this project because libyamjs.a and its V8
-        // runtime are built exclusively for arm64-v8a.
         ndk {
             abiFilters 'arm64-v8a'
         }
 
         externalNativeBuild {
             cmake {
-                // -fexceptions and -frtti are required by V8 (inside
-                // libyamjs.a) and by the C++ standard library we use
-                // throughout the project.
                 cppFlags '-std=c++17 -fexceptions -frtti'
                 arguments '-DANDROID_STL=c++_shared'
-
-                // Build only the "yamgg" shared library target.
-                // This prevents Gradle from attempting to produce an
-                // APK and keeps the output focused on the .so file
-                // that the injector needs.
-                targets 'yamgg'
             }
         }
     }
@@ -61,10 +47,6 @@ android {
             jniDebuggable true
         }
         release {
-            // Kept simple: no proguard because the DEX is loaded through
-            // InMemoryDexClassLoader at runtime, which is outside
-            // ProGuard's visibility. Minifying would only break the
-            // native lookup of com.yamgg.modview.ModView.
             minifyEnabled false
         }
     }
@@ -76,65 +58,13 @@ android {
 
     sourceSets {
         main {
-            // Standard layout: java/ + res/ + AndroidManifest.xml under
-            // src/main/, and C++ under src/main/jni/.
-            java.srcDirs        = ['src/main/java']
-            res.srcDirs         = ['src/main/res']
-            manifest.srcFile    = 'src/main/AndroidManifest.xml'
-            jniLibs.srcDirs     = ['src/main/jniLibs']
-        }
-    }
-
-    packagingOptions {
-        // The shared library is the only native file we produce.
-        // c++_shared.so is packaged automatically by the build.
-        jniLibs {
-            useLegacyPackaging true
+            java.srcDirs     = ['src/main/java']
+            res.srcDirs      = ['src/main/res']
+            manifest.srcFile = 'src/main/AndroidManifest.xml'
         }
     }
 }
 
 dependencies {
-    // The project does not depend on any AndroidX or Jetpack library.
-    // Everything runs on the platform APIs directly. This keeps the
-    // APK small and avoids a class-loader split between the app's DEX
-    // and the embedded DEX we load at runtime.
-}
-
-// ─── buildDex task ───────────────────────────────────────────
-// Runs scripts/build_dex.sh once before each build. If the script
-// fails (missing SDK, missing javac), it exits non-zero but with
-// ignoreExitValue the build continues using whatever
-// embedded_dex.h is currently on disk. The CMake custom target
-// (see CMakeLists.txt) is a second line of defence: it regenerates
-// the header whenever its dependencies are newer.
-//
-// We set ignoreExitValue = true deliberately, because a fresh clone
-// without the Android SDK would otherwise be unable to even
-// configure the project.
-task buildDex(type: Exec) {
-    description 'Compile Java sources to DEX and embed as a C header'
-    group       'build'
-
-    workingDir rootProject.projectDir
-    commandLine 'bash', 'scripts/build_dex.sh'
-
-    // Ignore failures so that gradle can still proceed if the SDK
-    // is absent. The user gets a warning in that case.
-    ignoreExitValue = true
-
-    doLast {
-        if (execResult.exitValue != 0) {
-            logger.warn("scripts/build_dex.sh exited with ${execResult.exitValue}")
-            logger.warn("embedded_dex.h may be stale; ModView may not attach")
-        }
-    }
-}
-
-// Make preBuild depend on buildDex so that a normal assembleDebug
-// always regenerates the DEX header if needed.
-tasks.whenTaskAdded { task ->
-    if (task.name == 'preBuild') {
-        task.dependsOn 'buildDex'
-    }
+    // No external dependencies.
 }

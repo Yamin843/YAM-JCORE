@@ -1,4 +1,4 @@
-name: Build shared library (.so)
+name: Build libyamgg.so
 
 on:
   push:
@@ -16,17 +16,17 @@ concurrency:
 
 jobs:
   build:
-    name: Build libyamgg.so
+    name: Build shared library
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Reassemble libyamjs.a from parts
+      - name: Reassemble libyamjs.a
         shell: bash
         run: |
           set -euo pipefail
@@ -45,7 +45,7 @@ jobs:
         with:
           packages: 'platform-tools'
 
-      - name: Install Android SDK packages
+      - name: Install SDK packages
         shell: bash
         run: |
           set -euo pipefail
@@ -58,11 +58,10 @@ jobs:
               "platform-tools"
           sdkmanager --list_installed
 
-      - name: Set up Gradle (system install, no wrapper jar)
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.4'
-          cache-read-only: false
 
       - name: Generate JS headers
         shell: bash
@@ -79,39 +78,45 @@ jobs:
           ./scripts/build_dex.sh
           ls -l app/src/main/jni/Generated/embedded_dex.h
 
-      - name: Build only the shared library
+      - name: Build shared library only
         shell: bash
         run: |
           set -euo pipefail
-          gradle :app:externalNativeBuildDebug --stacktrace --no-daemon --console=plain
+          gradle :app:externalNativeBuildDebug \
+              --stacktrace --no-daemon --console=plain
 
       - name: Locate libyamgg.so
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-          echo "Searching for libyamgg.so..."
-          find app/build -type f -name 'libyamgg.so' -print
-          echo ""
-          echo "All native libraries built:"
+          echo "=== Searching for libyamgg.so ==="
+          FOUND=$(find app/build -type f -name 'libyamgg.so' | head -1)
+          if [ -z "$FOUND" ]; then
+              echo "::error::libyamgg.so was not produced"
+              find app/build -type f -name '*.so' -print
+              exit 1
+          fi
+          echo "Found: $FOUND"
+          ls -lh "$FOUND"
+          echo "=== All .so files ==="
           find app/build -type f -name '*.so' -print
 
-      - name: Upload .so artifact
+      - name: Upload libyamgg.so
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: yamgg-shared-library
+          name: libyamgg.so
           path: |
-            app/build/intermediates/cmake/debug/obj/arm64-v8a/libyamgg.so
-            app/build/intermediates/merged_native_libs/debug/out/lib/arm64-v8a/libyamgg.so
+            app/build/**/libyamgg.so
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload build reports on failure
+      - name: Upload build logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-reports
+          name: build-logs
           path: |
             app/build/reports/
             app/build/outputs/logs/
