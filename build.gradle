@@ -1,0 +1,12 @@
+// Root build.gradle — AGP and Kotlin configuration for the whole project.
+// All version pins are here; sub-projects must not re-declare the plugin
+// versions or Gradle will complain about mixed plugin versions.
+
+plugins {
+    id 'com.android.application' version '8.1.4' apply false
+    id 'com.android.library'     version '8.1.4' apply false
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}

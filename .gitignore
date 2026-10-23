@@ -1,0 +1,59 @@
+# ─── Build artifacts ──────────────────────────────────────────
+build/
+.gradle/
+.externalNativeBuild/
+.cxx/
+app/build/
+app/.cxx/
+*.iml
+*.apk
+*.aab
+*.dex
+
+# ─── IDE ──────────────────────────────────────────────────────
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── Local configuration ─────────────────────────────────────
+local.properties
+
+# ─── The original libyamjs.a ─────────────────────────────────
+# 272 MB is too large for a single git object. The file is split
+# into 45 MB parts by scripts/split_lib.py and committed as
+# libyamjs.a.parts/part_NN. Reassemble with
+#   scripts/reassemble_lib.sh
+app/src/main/jni/all_libs/LIBYAMJS/libyamjs.a
+
+# ─── imgui files not needed for the build ────────────────────
+# ImGui ships with documentation, examples for every desktop
+# backend, and helper scripts. None of them are compiled on
+# Android. Excluding them saves about 30 MB and keeps the push
+# small.
+app/src/main/jni/all_libs/imgui-master/docs/
+app/src/main/jni/all_libs/imgui-master/examples/
+app/src/main/jni/all_libs/imgui-master/misc/
+app/src/main/jni/all_libs/imgui-master/.github/
+
+# ─── DEX build intermediate ──────────────────────────────────
+build/dex/
+
+# ─── OS metadata ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Python bytecode ────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+
+# ─── Empty msg dir (superseded) ────────────────────────────
+scripts/msg/
+
+
+# ─── Gradle wrapper jar ─────────────────────────────────────
+gradle/wrapper/gradle-wrapper.jar
+

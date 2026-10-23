@@ -1,0 +1,201 @@
+# .github/workflows/build.yml — CI for YAM-JCORE.
+#
+# Everything happens here: reassembling libyamjs.a from its parts,
+# generating the JS and DEX headers, and building the APK. The
+# developer only needs to push the repository from Termux with plain
+# git commands — no shell scripts, no chmod, no local build.
+#
+# We use the system `gradle` installed by gradle/actions/setup-gradle
+# instead of `./gradlew` because gradle-wrapper.jar is a binary and
+# is not committed (see .gitignore). This avoids the need for any
+# wrapper bootstrap step.
+
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  #  Prepare: check libyamjs.a parts completeness
+  # ─────────────────────────────────────────────────────────
+  prepare:
+    name: Check libyamjs.a parts
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+      part_count: ${{ steps.check.outputs.part_count }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check parts completeness
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PARTS="app/src/main/jni/all_libs/LIBYAMJS/libyamjs.a.parts"
+          MERGED="app/src/main/jni/all_libs/LIBYAMJS/libyamjs.a"
+
+          if [ -f "$MERGED" ]; then
+              SIZE=$(stat -c%s "$MERGED")
+              if [ "$SIZE" -gt 1024 ]; then
+                  echo "ready=true"  >> "$GITHUB_OUTPUT"
+                  echo "part_count=0" >> "$GITHUB_OUTPUT"
+                  echo "::notice::libyamjs.a already present ($SIZE bytes)"
+                  exit 0
+              fi
+          fi
+
+          if [ ! -d "$PARTS" ] || [ ! -f "$PARTS/MANIFEST.txt" ]; then
+              echo "ready=false"  >> "$GITHUB_OUTPUT"
+              echo "part_count=0" >> "$GITHUB_OUTPUT"
+              echo "::warning::parts missing; skipping build"
+              exit 0
+          fi
+
+          COUNT=$(awk -F ': *' '$1=="part_count"{print $2; exit}'  "$PARTS/MANIFEST.txt")
+          PREFIX=$(awk -F ': *' '$1=="part_prefix"{print $2; exit}' "$PARTS/MANIFEST.txt")
+
+          if [ -z "$COUNT" ] || [ -z "$PREFIX" ]; then
+              echo "ready=false"  >> "$GITHUB_OUTPUT"
+              echo "part_count=0" >> "$GITHUB_OUTPUT"
+              echo "::warning::MANIFEST.txt malformed; skipping build"
+              exit 0
+          fi
+
+          MISSING=0
+          for i in $(seq 0 $((COUNT - 1))); do
+              P=$(printf "%s/%s%02d" "$PARTS" "$PREFIX" "$i")
+              if [ ! -f "$P" ]; then
+                  MISSING=$((MISSING + 1))
+                  echo "  missing: $P"
+              fi
+          done
+
+          echo "part_count=$COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$MISSING" -gt 0 ]; then
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::$MISSING of $COUNT parts missing; skipping build"
+          else
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::All $COUNT parts present; proceeding to build"
+          fi
+
+  # ─────────────────────────────────────────────────────────
+  #  Build: reassemble + generate + assemble APK
+  # ─────────────────────────────────────────────────────────
+  build:
+    name: Build Debug APK
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Reassemble libyamjs.a from parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./scripts/reassemble_lib.sh
+          ./scripts/reassemble_lib.sh
+          ls -lh app/src/main/jni/all_libs/LIBYAMJS/libyamjs.a
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install \
+              "build-tools;34.0.0" \
+              "platforms;android-34" \
+              "ndk;25.2.9519653" \
+              "cmake;3.22.1" \
+              "platform-tools"
+          sdkmanager --list_installed
+
+      - name: Set up Gradle (system install, no wrapper jar needed)
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+          cache-read-only: false
+
+      - name: Generate JS headers (prelude_js.h + bootstrap_js.h)
+        shell: bash
+        run: |
+          python3 --version
+          python3 scripts/build_bootstrap.py
+          ls -l app/src/main/jni/Generated/*.h
+
+      - name: Generate embedded_dex.h from Java sources
+        shell: bash
+        continue-on-error: true
+        run: |
+          chmod +x ./scripts/build_dex.sh
+          ./scripts/build_dex.sh
+          ls -l app/src/main/jni/Generated/embedded_dex.h
+
+      - name: Build Debug APK with system gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle assembleDebug --stacktrace --no-daemon --console=plain
+
+      - name: Locate APK
+        if: success()
+        shell: bash
+        run: |
+          find app/build/outputs/apk -type f -name '*.apk' -print
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yam-jcore-debug-apk
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload build reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            app/build/reports/
+            app/build/outputs/logs/
+          if-no-files-found: ignore
+          retention-days: 7

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.yamgg.modview">
+
+    <!--
+      This library is designed to be injected into a target application
+      process, not launched as a standalone app. The manifest therefore
+      declares no Activity, Service, or Receiver. It exists purely to
+      satisfy the Android build system's expectations when producing the
+      shared object libyamgg.so and the embedded classes.dex.
+
+      The Java classes under com.yamgg.modview are packaged into an
+      InMemoryDexClassLoader at runtime and attached to whatever Activity
+      the target application is currently showing (see native/jni_bridge).
+    -->
+
+    <uses-sdk
+        android:minSdkVersion="24"
+        android:targetSdkVersion="34" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <application
+        android:allowBackup="false"
+        android:hasCode="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/YamTheme" />
+
+</manifest>
