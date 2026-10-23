@@ -1,0 +1,6 @@
+original_name:   libyamjs.a
+original_size:   284086530
+sha256:          725953220900aa2f827115fcf9b1ee63062dcac4cbe2c39e482178f0cbc23d0e
+part_size:       47185920
+part_count:      7
+part_prefix:     part_
