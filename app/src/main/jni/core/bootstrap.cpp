@@ -385,188 +385,157 @@ void bootstrap_signal_fatal(const char* message) {
 namespace {
 
 // ─────────────────────────────────────────────────────────────
-//  JS thread — async creation pattern
+//  JS thread — async creation pattern (no idle chain)
 // ─────────────────────────────────────────────────────────────
 //
-// The critical invariant: g_main_loop_run() MUST be active before
-// any yam_script_backend_create_sync() call, because the sync
-// variant schedules a job on js_context and then waits on a GCond
-// that only the main loop can signal.
+// CRITICAL INVARIANT:
+//   Never call any *_sync() API from this thread before
+//   g_main_loop_run() is active. The *_sync variants schedule a
+//   job on js_context and then block on a GCond that only the
+//   main loop can signal. Doing so deadlocks the entire app.
 //
-// We therefore use the *async* create/load APIs from a GSource that
-// fires once the loop is running, and chain the three stages via
-// g_idle_add() to keep the loop between each stage.
+// The pattern below is:
+//   1. Create the loop.
+//   2. Fire the async create() for the prelude. It schedules work
+//      and returns immediately.
+//   3. Enter the loop. The scheduled work executes.
+//   4. Each async completion callback schedules the next async
+//      step. Chain: prelude-create → prelude-load → bootstrap-
+//      create → bootstrap-load → signal script_loaded.
+//
+// Note on _load_finish: in this LIBYAMJS build, _load_finish
+// takes only (self, result) and does not return a GError.
+// Failures are detected by checking g_task_had_error() on the
+// result BEFORE calling _finish.
 
 struct JsThreadState {
-    int             stage           = 0;
-    YamScript*      prelude         = nullptr;
-    YamScript*      bootstrap       = nullptr;
-    GMainLoop*      loop            = nullptr;
-    GMainContext*   ctx             = nullptr;
-    std::string     error;
+    YamScript*   prelude   = nullptr;
+    YamScript*   bootstrap = nullptr;
+    GMainLoop*   loop      = nullptr;
+    std::string  error;
 };
 
-static JsThreadState* g_js_state = nullptr;
+static void on_prelude_create_done(GObject* src, GAsyncResult* res, gpointer user);
+static void on_prelude_load_done(GObject* src, GAsyncResult* res, gpointer user);
+static void on_bootstrap_create_done(GObject* src, GAsyncResult* res, gpointer user);
+static void on_bootstrap_load_done(GObject* src, GAsyncResult* res, gpointer user);
 
-static gboolean on_prelude_created(gpointer user);
-static gboolean on_prelude_loaded(gpointer user);
-static gboolean on_bootstrap_created(gpointer user);
-static gboolean on_bootstrap_loaded(gpointer user);
-
-static void on_prelude_create_done(GObject* source, GAsyncResult* res, gpointer user) {
-    GError* err = nullptr;
-    YamScript* script = yam_script_backend_create_finish(
-        YAM_SCRIPT_BACKEND(source), res, &err);
-    JsThreadState* st = static_cast<JsThreadState*>(user);
-    if (script == nullptr) {
-        st->error = err ? err->message : "prelude create failed";
-        if (err) g_error_free(err);
-    } else {
-        st->prelude = script;
-    }
-    g_idle_add(on_prelude_created, st);
-}
-
-static gboolean on_prelude_created(gpointer user) {
-    JsThreadState* st = static_cast<JsThreadState*>(user);
-    if (!st->error.empty() || st->prelude == nullptr) {
-        LOGE("prelude create failed: %s", st->error.c_str());
-        bootstrap_signal_fatal(st->error.c_str());
-        g_main_loop_quit(st->loop);
-        return G_SOURCE_REMOVE;
-    }
-    LOGI("prelude created");
-
-    // Load the prelude asynchronously.
-    yam_script_set_message_handler(st->prelude, on_script_message, nullptr, nullptr);
-    yam_script_load(st->prelude, nullptr,
-        (GAsyncReadyCallback)(+[](GObject* src, GAsyncResult* res, gpointer user) {
-            JsThreadState* st = static_cast<JsThreadState*>(user);
-            GError* err = nullptr;
-            yam_script_load_finish(YAM_SCRIPT(src), res, &err);
-            if (err) {
-                st->error = err->message;
-                g_error_free(err);
-            }
-            g_idle_add(on_prelude_loaded, st);
-        }), st);
-    return G_SOURCE_REMOVE;
-}
-
-static gboolean on_prelude_loaded(gpointer user) {
-    JsThreadState* st = static_cast<JsThreadState*>(user);
-    if (!st->error.empty()) {
-        LOGE("prelude load failed: %s", st->error.c_str());
-        bootstrap_signal_fatal(st->error.c_str());
-        g_main_loop_quit(st->loop);
-        return G_SOURCE_REMOVE;
-    }
-    LOGI("prelude loaded");
-    g_boot.prelude = st->prelude;
-
-    // Now create the bootstrap script.
-    yam_script_backend_create(g_boot.backend, "yamgg-bootstrap",
-        yamgg_bootstrap::kSource, nullptr, nullptr,
-        (GAsyncReadyCallback)(+[](GObject* src, GAsyncResult* res, gpointer user) {
-            JsThreadState* st = static_cast<JsThreadState*>(user);
-            GError* err = nullptr;
-            YamScript* script = yam_script_backend_create_finish(
-                YAM_SCRIPT_BACKEND(src), res, &err);
-            if (script == nullptr) {
-                st->error = err ? err->message : "bootstrap create failed";
-                if (err) g_error_free(err);
-            } else {
-                st->bootstrap = script;
-            }
-            g_idle_add(on_bootstrap_created, st);
-        }), st);
-    return G_SOURCE_REMOVE;
-}
-
-static gboolean on_bootstrap_created(gpointer user) {
-    JsThreadState* st = static_cast<JsThreadState*>(user);
-    if (!st->error.empty() || st->bootstrap == nullptr) {
-        LOGE("bootstrap create failed: %s", st->error.c_str());
-        bootstrap_signal_fatal(st->error.c_str());
-        g_main_loop_quit(st->loop);
-        return G_SOURCE_REMOVE;
-    }
-    LOGI("bootstrap created");
-    yam_script_set_message_handler(st->bootstrap, on_script_message, nullptr, nullptr);
-    yam_script_load(st->bootstrap, nullptr,
-        (GAsyncReadyCallback)(+[](GObject* src, GAsyncResult* res, gpointer user) {
-            JsThreadState* st = static_cast<JsThreadState*>(user);
-            GError* err = nullptr;
-            yam_script_load_finish(YAM_SCRIPT(src), res, &err);
-            if (err) {
-                st->error = err->message;
-                g_error_free(err);
-            }
-            g_idle_add(on_bootstrap_loaded, st);
-        }), st);
-    return G_SOURCE_REMOVE;
-}
-
-static gboolean on_bootstrap_loaded(gpointer user) {
-    JsThreadState* st = static_cast<JsThreadState*>(user);
-    if (!st->error.empty()) {
-        LOGE("bootstrap load failed: %s", st->error.c_str());
-        bootstrap_signal_fatal(st->error.c_str());
-        g_main_loop_quit(st->loop);
-        return G_SOURCE_REMOVE;
-    }
-    LOGI("bootstrap loaded — JS side is running");
-    g_boot.bootstrap = st->bootstrap;
-
-    // Signal the main thread that the bootstrap script is ready to
-    // receive commands. intelligent_initialize can now post
-    // smart_init.start and expect a reply.
-    g_mutex_lock(&g_boot.ready_mu);
-    g_boot.script_loaded = true;
-    g_cond_broadcast(&g_boot.ready_cv);
-    g_mutex_unlock(&g_boot.ready_mu);
-
-    return G_SOURCE_REMOVE;
-}
-
-gpointer js_thread_main(gpointer data) {
-    (void)data;
+gpointer js_thread_main(gpointer) {
     LOGI("js_thread_main: enter");
 
     JvmThreadScope jvm_scope(g_boot.vm);
     g_main_context_push_thread_default(g_boot.js_ctx);
 
-    // Create the state before the loop runs so callbacks can find it.
     auto* st = new JsThreadState();
-    st->ctx  = g_boot.js_ctx;
     st->loop = g_main_loop_new(g_boot.js_ctx, FALSE);
-    g_js_state = st;
     g_boot.js_loop = st->loop;
 
-    // Schedule the first async creation as soon as the loop starts.
-    // Using g_idle_add ensures the loop is running before we call
-    // into yam_script_backend_create.
-    g_idle_add(+[](gpointer user) -> gboolean {
-        JsThreadState* st = static_cast<JsThreadState*>(user);
-        yam_script_backend_create(g_boot.backend, "yamgg-prelude",
-            yamgg_prelude::kSource, nullptr, nullptr,
-            (GAsyncReadyCallback)on_prelude_create_done, st);
-        return G_SOURCE_REMOVE;
-    }, st);
+    // Fire async create — schedules work, does not block.
+    yam_script_backend_create(g_boot.backend, "yamgg-prelude",
+        yamgg_prelude::kSource, nullptr, nullptr,
+        (GAsyncReadyCallback)on_prelude_create_done, st);
 
     LOGI("js_thread_main: running main loop");
     g_main_loop_run(st->loop);
     LOGI("js_thread_main: main loop exited");
 
-    // Clean up after the loop returns.
     if (st->prelude)   { g_object_unref(st->prelude);   st->prelude   = nullptr; }
     if (st->bootstrap) { g_object_unref(st->bootstrap); st->bootstrap = nullptr; }
     g_main_loop_unref(st->loop);
     g_boot.js_loop = nullptr;
     g_main_context_pop_thread_default(g_boot.js_ctx);
     delete st;
-    g_js_state = nullptr;
     return nullptr;
+}
+
+static void on_prelude_create_done(GObject* src, GAsyncResult* res, gpointer user) {
+    auto* st = static_cast<JsThreadState*>(user);
+    GError* err = nullptr;
+    YamScript* script = yam_script_backend_create_finish(
+        YAM_SCRIPT_BACKEND(src), res, &err);
+    if (script == nullptr) {
+        st->error = err ? err->message : "prelude create failed";
+        if (err) g_error_free(err);
+        LOGE("prelude create failed: %s", st->error.c_str());
+        bootstrap_signal_fatal(st->error.c_str());
+        g_main_loop_quit(st->loop);
+        return;
+    }
+    st->prelude = script;
+    LOGI("prelude created");
+
+    yam_script_set_message_handler(st->prelude, on_script_message, nullptr, nullptr);
+    yam_script_load(st->prelude, nullptr,
+        (GAsyncReadyCallback)on_prelude_load_done, st);
+}
+
+static void on_prelude_load_done(GObject* src, GAsyncResult* res, gpointer user) {
+    auto* st = static_cast<JsThreadState*>(user);
+
+    // Detect load failure before calling _finish (which has no
+    // GError parameter in this LIBYAMJS build).
+    if (g_task_had_error(G_TASK(res))) {
+        GError* err = nullptr;
+        g_task_propagate_pointer(G_TASK(res), &err);
+        st->error = err ? err->message : "prelude load failed";
+        if (err) g_error_free(err);
+        LOGE("prelude load failed: %s", st->error.c_str());
+        bootstrap_signal_fatal(st->error.c_str());
+        g_main_loop_quit(st->loop);
+        return;
+    }
+    yam_script_load_finish(YAM_SCRIPT(src), res);
+    LOGI("prelude loaded");
+    g_boot.prelude = st->prelude;
+
+    yam_script_backend_create(g_boot.backend, "yamgg-bootstrap",
+        yamgg_bootstrap::kSource, nullptr, nullptr,
+        (GAsyncReadyCallback)on_bootstrap_create_done, st);
+}
+
+static void on_bootstrap_create_done(GObject* src, GAsyncResult* res, gpointer user) {
+    auto* st = static_cast<JsThreadState*>(user);
+    GError* err = nullptr;
+    YamScript* script = yam_script_backend_create_finish(
+        YAM_SCRIPT_BACKEND(src), res, &err);
+    if (script == nullptr) {
+        st->error = err ? err->message : "bootstrap create failed";
+        if (err) g_error_free(err);
+        LOGE("bootstrap create failed: %s", st->error.c_str());
+        bootstrap_signal_fatal(st->error.c_str());
+        g_main_loop_quit(st->loop);
+        return;
+    }
+    st->bootstrap = script;
+    LOGI("bootstrap created");
+
+    yam_script_set_message_handler(st->bootstrap, on_script_message, nullptr, nullptr);
+    yam_script_load(st->bootstrap, nullptr,
+        (GAsyncReadyCallback)on_bootstrap_load_done, st);
+}
+
+static void on_bootstrap_load_done(GObject* src, GAsyncResult* res, gpointer user) {
+    auto* st = static_cast<JsThreadState*>(user);
+
+    if (g_task_had_error(G_TASK(res))) {
+        GError* err = nullptr;
+        g_task_propagate_pointer(G_TASK(res), &err);
+        st->error = err ? err->message : "bootstrap load failed";
+        if (err) g_error_free(err);
+        LOGE("bootstrap load failed: %s", st->error.c_str());
+        bootstrap_signal_fatal(st->error.c_str());
+        g_main_loop_quit(st->loop);
+        return;
+    }
+    yam_script_load_finish(YAM_SCRIPT(src), res);
+    LOGI("bootstrap loaded — JS side is running");
+    g_boot.bootstrap = st->bootstrap;
+
+    // Signal the main thread that the bootstrap script is ready.
+    g_mutex_lock(&g_boot.ready_mu);
+    g_boot.script_loaded = true;
+    g_cond_broadcast(&g_boot.ready_cv);
+    g_mutex_unlock(&g_boot.ready_mu);
 }
 
 void on_script_message(const gchar* json, GBytes* data, gpointer) {
