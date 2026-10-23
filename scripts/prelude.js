@@ -7,28 +7,19 @@
 (function () {
     "use strict";
 
-    var bridge = null;
-    try {
-        if (typeof globalThis.__yamgg_bridge_ready__ === "function") {
-            bridge = globalThis.__yamgg_bridge_ready__();
-        }
-    } catch (e) {
-        send({
-            type: "error",
-            phase: "prelude",
-            message: String((e && e.message) || e)
-        });
-        return;
-    }
+    // Do NOT call __yamgg_bridge_ready__() here. That function
+    // touches Java.available, which tries to initialize the bridge
+    // against libart. If libart has not finished loading yet (late
+    // ART init, embedded libart, etc.), this crashes the process.
+    //
+    // The bridge is initialized later by bootstrap.cpp's
+    // intelligent_initialize(), which polls for libart first.
+    var hasJava = (typeof globalThis.Java === "object" && globalThis.Java !== null);
 
     send({
         type: "ready",
         phase: "prelude",
-        hasJava: (typeof globalThis.Java === "object"),
-        bridge: bridge ? {
-            variant:   bridge.variant,
-            available: bridge.available,
-            version:   bridge.version
-        } : null
+        hasJava: hasJava,
+        bridge: null   // populated later, after libart is confirmed
     });
 })();

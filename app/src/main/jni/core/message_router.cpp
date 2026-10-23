@@ -118,6 +118,22 @@ void MessageRouter::handle_message(const char* raw, GBytes* data) {
     // There is no cap on the number of chunks or the total size — the
     // buffers grow to fit whatever the JS side sends.
     {
+        // GumJS wraps every send() in { "type": "send", "payload": ... }.
+        // Unwrap it before inspecting the inner type so that chunk_*
+        // and ready/error/log are handled the same way whether the JS
+        // script used send() directly or the auto-chunk wrapper.
+        if (msg.value("type", std::string()) == "send" &&
+            msg.contains("payload") && msg["payload"].is_object()) {
+            nlohmann::json inner = msg["payload"];
+            const std::string inner_type = inner.value("type", std::string());
+            if (inner_type == "chunk_begin" || inner_type == "chunk_data" ||
+                inner_type == "chunk_end" || inner_type == "ready" ||
+                inner_type == "error" || inner_type == "log" ||
+                inner_type == "event" || inner_type == "reply") {
+                msg = inner;
+            }
+        }
+
         const std::string t = msg.value("type", std::string());
         if (t == "chunk_begin") {
             if (!msg.contains("id") || !msg["id"].is_number_unsigned()) return;
