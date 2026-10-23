@@ -61,7 +61,6 @@ private:
     struct MethodHookState {
         uint64_t hook_id    = 0;
         bool     active     = false;
-        uint32_t call_count = 0;
     };
 
     // ── Instance list ───────────────────────────────────────
@@ -110,7 +109,7 @@ private:
     std::string  selected_class_;
     bool         initialized_ = false;
 
-    // Per-method hooks. Key is "className|methodName|arg1,arg2,...".
+    // Per-method hook state. Key is "className|methodName|arg1,arg2,...".
     std::map<std::string, MethodHookState> method_hooks_;
 
     // Instances of the currently selected class.

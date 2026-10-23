@@ -322,12 +322,6 @@ void ClassBrowserTab::draw_details() {
             ImGui::TextUnformatted(")");
             if (hooked) ImGui::PopStyleColor();
 
-            if (state.call_count > 0) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f),
-                                   "(%u)", state.call_count);
-            }
-
             ImGui::SameLine();
             if (hooked) {
                 if (ImGui::SmallButton("untrace")) {
@@ -499,15 +493,8 @@ void ClassBrowserTab::toggle_trace(const bridge::MethodSignature& m) {
     std::string error;
     uint64_t hook_id = bridge::HookManager::instance().install(
         detail_.class_name, m.name, m.argumentTypes,
-        // Per-hook enter callback: increments this method's counter.
-        [this, key](const bridge::HookEnterEvent&) {
-            marshal_to_ui([this, key]() {
-                auto it = method_hooks_.find(key);
-                if (it != method_hooks_.end()) {
-                    it->second.call_count++;
-                }
-            });
-        },
+        // Logging happens in HookEditorTab. No per-method counter.
+        nullptr,
         nullptr,
         error,
         5000);

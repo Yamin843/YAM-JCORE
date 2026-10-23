@@ -20,6 +20,8 @@
 
 #include <json.hpp>
 
+#include "imgui.h"
+
 namespace yamgg {
 
 class InputDialog {

@@ -9,6 +9,84 @@
 
 namespace yamgg {
 
+namespace {
+
+// Human-friendly formatting for a JSON value coming from toJsonSafe().
+//   strings   → quoted
+//   numbers   → as-is
+//   Bundle    → Bundle{key: value, ...}
+//   Map/JSON  → {key: value, ...}
+//   Array     → [item, item, ...]
+//   JavaObject→ its toString or <className>
+std::string format_value(const nlohmann::json& v) {
+    if (v.is_null())    return "null";
+    if (v.is_boolean()) return v.get<bool>() ? "true" : "false";
+    if (v.is_string())  return "\"" + v.get<std::string>() + "\"";
+    if (v.is_number_integer())  return std::to_string(v.get<long long>());
+    if (v.is_number_unsigned()) return std::to_string(v.get<unsigned long long>());
+    if (v.is_number_float()) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.6g", v.get<double>());
+        return buf;
+    }
+
+    if (v.is_object()) {
+        if (v.contains("__type") && v["__type"].is_string()) {
+            const std::string t = v["__type"].get<std::string>();
+            if (t == "JavaObject") {
+                std::string cls = v.value("className", std::string());
+                std::string str = v.value("toString", std::string());
+                if (!str.empty()) return str;
+                return cls.empty() ? "<object>" : ("<" + cls + ">");
+            }
+            if (t == "Bundle" || t == "Map" || t == "JSONObject") {
+                std::string out = (t == "Bundle") ? "Bundle{" : "{";
+                if (v.contains("entries") && v["entries"].is_object()) {
+                    bool first = true;
+                    for (auto it = v["entries"].begin(); it != v["entries"].end(); ++it) {
+                        if (!first) out += ", ";
+                        out += it.key() + ": " + format_value(it.value());
+                        first = false;
+                    }
+                }
+                return out + "}";
+            }
+            if (t == "JSONArray" || t == "Collection") {
+                std::string out = "[";
+                if (v.contains("items") && v["items"].is_array()) {
+                    bool first = true;
+                    for (const auto& item : v["items"]) {
+                        if (!first) out += ", ";
+                        out += format_value(item);
+                        first = false;
+                    }
+                }
+                return out + "]";
+            }
+            if (t == "ArrayBuffer") {
+                return "[bytes len=" + std::to_string(v.value("length", (size_t)0)) + "]";
+            }
+            if (t == "Int64" || t == "UInt64" || t == "NativePointer") {
+                return v.value("value", std::string("<num>"));
+            }
+        }
+        try { return v.dump(); } catch (...) { return "<obj>"; }
+    }
+    if (v.is_array()) {
+        std::string out = "[";
+        for (size_t i = 0; i < v.size(); i++) {
+            if (i) out += ", ";
+            out += format_value(v[i]);
+        }
+        return out + "]";
+    }
+    return "?";
+}
+
+} // namespace
+
+namespace yamgg {
+
 HookEditorTab& HookEditorTab::instance() {
     static HookEditorTab t;
     return t;
@@ -116,11 +194,11 @@ void HookEditorTab::uninstall_hook(uint64_t hook_id) {
 }
 
 void HookEditorTab::on_enter(const bridge::HookEnterEvent& ev) {
-    std::string text = "ENTER " + ev.className + "." + ev.methodName + "(";
+    std::string text = "→ " + ev.className + "." + ev.methodName + "(";
     if (ev.args.is_array()) {
         for (size_t i = 0; i < ev.args.size(); i++) {
             if (i) text += ", ";
-            try { text += ev.args[i].dump(); } catch (...) { text += "?"; }
+            text += format_value(ev.args[i]);
         }
     }
     text += ")";
@@ -128,11 +206,11 @@ void HookEditorTab::on_enter(const bridge::HookEnterEvent& ev) {
 }
 
 void HookEditorTab::on_leave(const bridge::HookLeaveEvent& ev) {
-    std::string text = "LEAVE " + ev.className + "." + ev.methodName + " → ";
+    std::string text = "← " + ev.className + "." + ev.methodName + " → ";
     if (ev.threw) {
         text += "threw " + ev.error;
     } else {
-        try { text += ev.returnValue.dump(); } catch (...) { text += "?"; }
+        text += format_value(ev.returnValue);
     }
     append_log(false, text);
 }

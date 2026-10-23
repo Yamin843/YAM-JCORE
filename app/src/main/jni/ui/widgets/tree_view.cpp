@@ -4,14 +4,12 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
-#include <unordered_map>
+#include <vector>
 
 #include "imgui.h"
 #include "imgui_internal.h"
 
 namespace yamgg {
-
-} // namespace
 
 void TreeView::set_data(const std::vector<std::string>& names) {
     roots_.clear();
@@ -21,7 +19,7 @@ void TreeView::set_data(const std::vector<std::string>& names) {
         if (!name.empty()) insert_class(name);
     }
 
-    // Sort each level recursively.
+    // Sort children recursively: packages first, then alphabetical.
     std::function<void(std::vector<NodePtr>&)> sort_children =
         [&](std::vector<NodePtr>& level) {
             std::sort(level.begin(), level.end(),
@@ -35,8 +33,7 @@ void TreeView::set_data(const std::vector<std::string>& names) {
         };
     sort_children(roots_);
 
-    // Auto-expand the first root's first level so that something is
-    // visible immediately.
+    // Auto-expand the first package and its first sub-package.
     for (auto& r : roots_) {
         if (r->kind == Kind::Package) {
             r->expanded = true;
@@ -60,8 +57,6 @@ void TreeView::clear() {
 }
 
 void TreeView::insert_class(const std::string& full_name) {
-    // Split on '.' into segments. Array types like "[B" contain no dot;
-    // they become their own root with the label "[B".
     std::vector<std::string> parts;
     if (!full_name.empty() && full_name[0] == '[') {
         parts.push_back(full_name);
@@ -85,9 +80,7 @@ void TreeView::insert_class(const std::string& full_name) {
 
     for (size_t i = 0; i < parts.size(); i++) {
         const std::string& part = parts[i];
-        if (!accumulated.empty() && accumulated[0] != '[') {
-            accumulated += ".";
-        }
+        if (!accumulated.empty() && accumulated[0] != '[') accumulated += ".";
         accumulated += part;
 
         NodePtr* found = nullptr;
@@ -96,7 +89,7 @@ void TreeView::insert_class(const std::string& full_name) {
         }
 
         bool is_last = (i == parts.size() - 1);
-        Kind kind = is_last ? Kind::Class : Kind::Package;
+        Kind kind    = is_last ? Kind::Class : Kind::Package;
 
         if (found == nullptr) {
             NodePtr node(new Node());
@@ -107,9 +100,6 @@ void TreeView::insert_class(const std::string& full_name) {
             (*level).push_back(std::move(node));
             found = &(*level).back();
         } else if (is_last && (*found)->kind == Kind::Package) {
-            // A class exists with a package name (rare but possible for
-            // nested classes). Keep it as package but record the class
-            // name on it.
             (*found)->full_name = full_name;
         }
 
@@ -130,6 +120,7 @@ void TreeView::set_filter(const std::string& filter) {
     filter_ = filter;
     needs_filter_apply_ = true;
 }
+
 void TreeView::ensure_default_expansion(Node* root) {
     if (!root) return;
     if (root->kind == Kind::Package && !root->expanded && !root->children.empty()) {
@@ -137,19 +128,14 @@ void TreeView::ensure_default_expansion(Node* root) {
     }
 }
 
-// Renders one node and (if expanded) its descendants. Returns true if
-// `node` was clicked this frame.
 bool TreeView::draw_node(Node* node, const std::string& filter) {
     if (node == nullptr) return false;
 
-    // Filtering: if filter is non-empty, hide nodes whose subtree has
-    // no match.
     bool matches = filter.empty();
     if (!matches) {
         if (node->kind == Kind::Class) {
             matches = node->full_name.find(filter) != std::string::npos;
         } else {
-            // Package matches if any descendant matches. Recurse cheaply.
             std::function<bool(Node*)> any_match = [&](Node* n) -> bool {
                 for (auto& c : n->children) {
                     if (c->kind == Kind::Class) {
@@ -173,12 +159,9 @@ bool TreeView::draw_node(Node* node, const std::string& filter) {
                                  | ImGuiTreeNodeFlags_OpenOnDoubleClick
                                  | ImGuiTreeNodeFlags_SpanAvailWidth;
         if (node->expanded) flags |= ImGuiTreeNodeFlags_DefaultOpen;
-
-        bool is_selected = (node->full_name == selected_);
-        if (is_selected) flags |= ImGuiTreeNodeFlags_Selected;
+        if (node->full_name == selected_) flags |= ImGuiTreeNodeFlags_Selected;
 
         if (!filter.empty()) {
-            // While filtering, force-expand so matches are visible.
             ImGui::SetNextItemOpen(true, ImGuiCond_Always);
         } else {
             ImGui::SetNextItemOpen(node->expanded, ImGuiCond_Always);
@@ -194,13 +177,10 @@ bool TreeView::draw_node(Node* node, const std::string& filter) {
         }
 
         if (open) {
-            for (auto& child : node->children) {
-                draw_node(child.get(), filter);
-            }
+            for (auto& child : node->children) draw_node(child.get(), filter);
             ImGui::TreePop();
         }
 
-        // Cache the expanded state.
         if (!filter.empty()) node->expanded = true;
         else node->expanded = open;
     } else {
@@ -234,9 +214,7 @@ bool TreeView::draw(const char* id, float height) {
         ImGui::TextDisabled("No classes loaded.");
     } else {
         for (auto& root : roots_) {
-            if (draw_node(root.get(), filter_)) {
-                selection_changed = true;
-            }
+            if (draw_node(root.get(), filter_)) selection_changed = true;
         }
     }
 

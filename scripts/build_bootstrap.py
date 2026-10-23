@@ -43,7 +43,6 @@ LIB_ORDER = [
     "field_ops",
     "handle_ops",
     "convert_ops",
-    "register_ops",
     "java_api",
     "dispatcher",
 ]
