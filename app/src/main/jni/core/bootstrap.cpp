@@ -485,8 +485,16 @@ static void on_prelude_load_done(GObject* src, GAsyncResult* res, gpointer user)
         return;
     }
     yam_script_load_finish(YAM_SCRIPT(src), res);
-    LOGI("prelude loaded");
+    LOGI("prelude loaded — signaling prelude_ready directly (no JS send)");
     g_boot.prelude = st->prelude;
+
+    // Signal prelude_ready from C++ so that we do NOT depend on a
+    // JS-side send() message. This eliminates any crash in the
+    // send() path from affecting bootstrap progress.
+    g_mutex_lock(&g_boot.ready_mu);
+    g_boot.prelude_ready = true;
+    g_cond_broadcast(&g_boot.ready_cv);
+    g_mutex_unlock(&g_boot.ready_mu);
 
     yam_script_backend_create(g_boot.backend, "yamgg-bootstrap",
         yamgg_bootstrap::kSource, nullptr, nullptr,
@@ -528,11 +536,12 @@ static void on_bootstrap_load_done(GObject* src, GAsyncResult* res, gpointer use
         return;
     }
     yam_script_load_finish(YAM_SCRIPT(src), res);
-    LOGI("bootstrap loaded — JS side is running");
+    LOGI("bootstrap loaded — signaling script_loaded directly");
     g_boot.bootstrap = st->bootstrap;
 
-    // Signal the main thread that the bootstrap script is ready.
+    // Signal script_loaded from C++ — no dependency on JS send().
     g_mutex_lock(&g_boot.ready_mu);
+    g_boot.bootstrap_ready = true;
     g_boot.script_loaded = true;
     g_cond_broadcast(&g_boot.ready_cv);
     g_mutex_unlock(&g_boot.ready_mu);
