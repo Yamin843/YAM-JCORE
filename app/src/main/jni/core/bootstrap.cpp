@@ -232,7 +232,24 @@ bool bootstrap_start(JavaVM* vm) {
              "art::ArtGuard will populate on arrival");
     }
 
-    return true;
+        // ── Step 7: intelligent initialization ─────────────────
+    // Wait for smart_init to confirm libart is available, then
+    // (if needed) fall back to native JNI. Without this step,
+    // Java.available may have been evaluated before libart was
+    // loaded, permanently caching a failure.
+    if (!art::intelligent_initialize(vm)) {
+        const auto& s = art::intelligent_state();
+        LOGE("intelligent_initialize failed: mode=%d reason=%s",
+             static_cast<int>(s.mode), s.reason.c_str());
+        set_state(SessionState::Dead);
+        return false;
+    }
+
+    LOGI("bootstrap_start: intelligent mode = %s",
+         art::intelligent_state().mode == art::IntelligentMode::Full
+            ? "FULL" : "JNI_ONLY");
+
+return true;
 }
 
 // ═══════════════════════════════════════════════════════════════
