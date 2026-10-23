@@ -484,8 +484,11 @@ static void on_prelude_load_done(GObject* src, GAsyncResult* res, gpointer user)
         g_main_loop_quit(st->loop);
         return;
     }
-    yam_script_load_finish(YAM_SCRIPT(src), res);
-    LOGI("prelude loaded — signaling prelude_ready directly (no JS send)");
+    // Do NOT call yam_script_load_finish here. In this LIBYAMJS
+    // build it dereferences art::Thread state that is not valid on
+    // the yamgg-js thread, causing SIGSEGV at fault addr 0xa9.
+    // g_task_had_error() above already told us the load succeeded.
+    LOGI("prelude loaded — signaling prelude_ready directly (no _finish)");
     g_boot.prelude = st->prelude;
 
     // Signal prelude_ready from C++ so that we do NOT depend on a
@@ -535,8 +538,8 @@ static void on_bootstrap_load_done(GObject* src, GAsyncResult* res, gpointer use
         g_main_loop_quit(st->loop);
         return;
     }
-    yam_script_load_finish(YAM_SCRIPT(src), res);
-    LOGI("bootstrap loaded — signaling script_loaded directly");
+    // Do NOT call yam_script_load_finish here (see note above).
+    LOGI("bootstrap loaded — signaling script_loaded directly (no _finish)");
     g_boot.bootstrap = st->bootstrap;
 
     // Signal script_loaded from C++ — no dependency on JS send().

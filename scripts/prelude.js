@@ -1,36 +1,10 @@
-// scripts/prelude.js — diagnostic-only. Logs before each step so
-// that if the process crashes, the last logged line tells us which
-// operation caused it.
+// scripts/prelude.js — intentionally empty.
+//
+// The C++ bootstrap path signals prelude_ready from the load
+// callback, so the JS side does not need to send anything. Keeping
+// prelude empty eliminates any dependency on send() and on the
+// Java bridge during early initialization.
 (function () {
     "use strict";
-
-    function trySend(msg) {
-        try {
-            if (typeof send === "function") send(msg);
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-
-    // Step 1: is the JS runtime itself functional?
-    trySend({ type: "log", level: "info", message: "prelude:A:enter" });
-
-    // Step 2: does the global scope exist?
-    var hasJava = false;
-    try {
-        hasJava = (typeof globalThis.Java === "object" && globalThis.Java !== null);
-        trySend({ type: "log", level: "info",
-                  message: "prelude:B:JavaTypeof=" + typeof globalThis.Java });
-    } catch (e) {
-        trySend({ type: "log", level: "error",
-                  message: "prelude:B:failed:" + String(e) });
-        return;
-    }
-
-    // Step 3: send the ready signal.
-    trySend({ type: "ready", phase: "prelude",
-              hasJava: hasJava, bridge: null });
-
-    trySend({ type: "log", level: "info", message: "prelude:C:ready-sent" });
+    // no-op
 })();
