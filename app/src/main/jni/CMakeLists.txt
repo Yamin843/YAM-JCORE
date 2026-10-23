@@ -184,7 +184,6 @@ target_link_libraries(yamgg PRIVATE
     ${GLES_LIB}
     ${DL_LIB}
     ${Z_LIB}
-    c++_shared
 )
 
 # Link libunwind only if we found it (see above).
@@ -198,10 +197,27 @@ endif()
 # which registers gum_on_thread_realize and installs the thread
 # cloak. Skipping it causes JNI recursion crashes on the first
 # Java hook.
+# libyamjs.a references C++ standard library symbols
+# (std::__ndk1::basic_stringstream, __libcpp_verbose_abort, …).
+# The GNU linker processes libraries left-to-right and only
+# contributes symbols from a shared library when there are already
+# unresolved references at the moment it is processed. Because
+# c++_shared came BEFORE libyamjs.a, --as-needed dropped it before
+# libyamjs.a's symbols entered the picture, and every C++ reference
+# ended up unresolved.
+#
+# The fix is twofold:
+#   1. Link c++_shared AFTER libyamjs.a.
+#   2. Force it to stay in the link with --no-as-needed, because
+#      nothing before it references C++ symbols at that point in
+#      the command line.
 target_link_libraries(yamgg PRIVATE
     -Wl,--whole-archive
     "${LIBYAMJS_DIR}/libyamjs.a"
     -Wl,--no-whole-archive
+    -Wl,--no-as-needed
+    c++_shared
+    -Wl,--as-needed
 )
 
 # ─── Linker options ──────────────────────────────────────────
