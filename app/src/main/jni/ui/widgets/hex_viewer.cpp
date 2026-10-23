@@ -82,7 +82,7 @@ size_t HexViewer::size() const {
 void HexViewer::draw(const char* id, float height) {
     if (id == nullptr || *id == '\0') id = "##hex";
 
-    ImGui::BeginChild(id, ImVec2(0, height), ImGuiChildFlags_Border);
+    ImGui::BeginChild(id, ImVec2(0, height), ImGuiChildFlags_Borders);
 
     if (!error_.empty()) {
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Error: %s",

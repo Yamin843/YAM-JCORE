@@ -1,17 +1,23 @@
-// ui/tabs/class_browser_tab.h — browse and search Java classes.
+// ui/tabs/class_browser_tab.h — browse classes, trace methods, call
+// methods, create instances.
 //
-// Left side: tree of packages and classes (from bridge.class.list).
-// Right side: selected class's methods, fields, constructors
-// (from bridge.class.inspect), with per-method Hook and Call buttons
-// that hand off to the hook_editor and call_panel tabs.
+// Layout (right side of the split):
 //
-// All loading is asynchronous. The UI shows a spinner while a request
-// is in flight and a client-side 15s timeout unblocks the spinner if
-// the JS thread never replies.
+//   [Find instances] [strategy]           ← instance acquisition
+//   [Instances list]                      ← select one for instance calls
+//   [Constructors]  $new(...)  [create]   ← create new instance
+//   [Methods]       ret name(...)  [trace] [call]  (calls: N)
+//   [Fields]        type name
+//
+// The trace button is a toggle: first click installs a hook, second
+// click uninstalls it. The row's text color changes while a hook is
+// active, and a live call counter appears next to the buttons.
 #ifndef YAMGG_UI_TABS_CLASS_BROWSER_TAB_H
 #define YAMGG_UI_TABS_CLASS_BROWSER_TAB_H
 
 #include <chrono>
+#include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -30,53 +36,13 @@ public:
     void draw() override;
     void on_activated() override;
 
-    // Called by other tabs (e.g. hook_editor after a successful hook)
-    // to display a class.
+    // Called by other tabs to display a class.
     void show_class(const std::string& class_name);
 
 private:
     ClassBrowserTab() = default;
 
-    // ── Instance search (heap.choose) ───────────────────────
-    struct InstanceSearchState {
-        bool                          running = false;
-        uint64_t                      session_id = 0;
-        int                           strategy = 0;   // 0=Auto, 1=JVMTI, 2=GetInstances
-        int                           total_matches = 0;
-        std::chrono::steady_clock::time_point started;
-        std::string                   error;
-        struct Match {
-            std::string handle;
-            std::string display;
-        };
-        std::vector<Match>            matches;
-    };
-    InstanceSearchState instance_search_;
-
-    void start_instance_search();
-    void stop_instance_search();
-
-    // ── Advanced method search (enumerateMethods) ───────────
-    struct MethodSearchState {
-        bool                          running = false;
-        std::string                   pattern;
-        std::chrono::steady_clock::time_point started;
-        std::string                   error;
-        struct Match {
-            std::string className;
-            std::string methodName;
-            std::string loader;
-        };
-        std::vector<Match>            matches;
-    };
-    MethodSearchState method_search_;
-    char              method_pattern_buf_[256] = "com.example.*!*";
-
-    void start_method_search();
-
-    void draw_instance_search_section();
-    void draw_method_search_section();
-
+    // ── Loading state ───────────────────────────────────────
     struct ListState {
         bool        loading = false;
         std::string error;
@@ -91,12 +57,50 @@ private:
         std::chrono::steady_clock::time_point started;
     };
 
+    // ── Trace state per method ──────────────────────────────
+    struct MethodHookState {
+        uint64_t hook_id    = 0;
+        bool     active     = false;
+        uint32_t call_count = 0;
+    };
+
+    // ── Instance list ───────────────────────────────────────
+    struct InstanceItem {
+        std::string handle;
+        std::string display;
+    };
+
+    // ── Method search (global) ──────────────────────────────
+    struct MethodSearchState {
+        bool                          running = false;
+        std::string                   pattern;
+        std::chrono::steady_clock::time_point started;
+        std::string                   error;
+        struct Match {
+            std::string className;
+            std::string methodName;
+        };
+        std::vector<Match>            matches;
+    };
+
+    // ── Flow control ────────────────────────────────────────
     void refresh_list();
     void load_detail(const std::string& class_name);
     void check_timeouts();
 
+    // ── Drawing ─────────────────────────────────────────────
     void draw_details();
+    void draw_instances_section();
+    void draw_method_search_bar();
 
+    // ── Actions ─────────────────────────────────────────────
+    void toggle_trace(const bridge::MethodSignature& m);
+    void call_method(const bridge::MethodSignature& m);
+    void create_instance(const bridge::ConstructorSignature& ctor);
+    void find_instances();
+    void stop_instance_search();
+
+    // ── State ───────────────────────────────────────────────
     ListState    list_;
     DetailState  detail_;
     TreeView     tree_;
@@ -104,12 +108,26 @@ private:
     char         filter_buf_[256] = {0};
     std::string  last_filter_;
     std::string  selected_class_;
-
     bool         initialized_ = false;
 
-    // Method selection state for the inline hook dialog trigger.
-    int          selected_method_   = -1;
-    int          selected_overload_ = -1;
+    // Per-method hooks. Key is "className|methodName|arg1,arg2,...".
+    std::map<std::string, MethodHookState> method_hooks_;
+
+    // Instances of the currently selected class.
+    std::vector<InstanceItem>  instances_;
+    int                        selected_instance_ = -1;
+
+    // Instance search state.
+    bool                       instance_search_running_ = false;
+    uint64_t                   instance_search_id_ = 0;
+    int                        instance_search_strategy_ = 1;   // 1=JVMTI
+    std::string                instance_search_error_;
+
+    // Global method search (top bar).
+    MethodSearchState          method_search_;
+    char                       method_pattern_buf_[256] = "com.example.*!*";
+
+    void start_method_search();
 };
 
 } // namespace yamgg

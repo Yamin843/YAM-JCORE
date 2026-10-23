@@ -1,22 +1,39 @@
 // ui/tabs/class_browser_tab.cpp
 #include "ui/tabs/class_browser_tab.h"
 
+#include <cstdio>
 #include <cstring>
 
+#include "art/heap_scanner.h"
+#include "bridge/handle_registry.h"
+#include "bridge/hook_manager.h"
 #include "bridge/type_converter.h"
 #include "core/message_router.h"
 #include "core/thread_sync.h"
 #include "imgui.h"
 #include "ui/main_window.h"
+#include "ui/notification.h"
 #include "ui/tabs/call_panel_tab.h"
 #include "ui/tabs/hook_editor_tab.h"
-#include "art/heap_scanner.h"
 
 namespace yamgg {
 
 namespace {
+
 constexpr int kTimeoutSeconds = 15;
+
+std::string make_method_key(const std::string& cls,
+                            const std::string& mth,
+                            const std::vector<std::string>& args) {
+    std::string key = cls + "|" + mth + "|";
+    for (size_t i = 0; i < args.size(); i++) {
+        if (i) key += ",";
+        key += args[i];
+    }
+    return key;
 }
+
+} // namespace
 
 ClassBrowserTab& ClassBrowserTab::instance() {
     static ClassBrowserTab t;
@@ -26,6 +43,22 @@ ClassBrowserTab& ClassBrowserTab::instance() {
 void ClassBrowserTab::on_activated() {
     if (!initialized_) {
         initialized_ = true;
+
+        // Register the instance-created callback once. When the call
+        // panel creates an instance, we append it to our list so it
+        // becomes selectable for instance method calls.
+        static bool cb_registered = false;
+        if (!cb_registered) {
+            cb_registered = true;
+            CallPanelTab::instance().set_instance_created_callback(
+                [this](const std::string& cls, const std::string& handle) {
+                    if (cls == detail_.class_name) {
+                        instances_.push_back({handle, "<created>"});
+                        selected_instance_ = (int)instances_.size() - 1;
+                    }
+                });
+        }
+
         refresh_list();
     }
 }
@@ -37,21 +70,19 @@ void ClassBrowserTab::show_class(const std::string& class_name) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Async loading
+//  Loading
 // ═══════════════════════════════════════════════════════════════
 
 void ClassBrowserTab::refresh_list() {
     if (list_.loading) return;
-    list_.loading  = true;
+    list_.loading = true;
     list_.error.clear();
-    list_.started  = std::chrono::steady_clock::now();
-
-    std::string filter = filter_buf_;
-    last_filter_ = filter;
+    list_.started = std::chrono::steady_clock::now();
+    last_filter_ = filter_buf_;
 
     MessageRouter::instance().post_command(
         "bridge.class.list",
-        nlohmann::json{{"filter", filter}},
+        nlohmann::json{{"filter", std::string(filter_buf_)}},
         [this](bool ok, const nlohmann::json& reply) {
             marshal_to_ui([this, ok, reply]() {
                 list_.loading = false;
@@ -75,21 +106,23 @@ void ClassBrowserTab::load_detail(const std::string& class_name) {
     if (class_name.empty()) return;
     if (detail_.loading && detail_.class_name == class_name) return;
 
-    detail_.loading     = true;
-    detail_.class_name  = class_name;
+    detail_.loading = true;
+    detail_.class_name = class_name;
     detail_.error.clear();
-    detail_.inspection  = bridge::ClassInspection{};
-    detail_.started     = std::chrono::steady_clock::now();
-    selected_class_     = class_name;
+    detail_.inspection = bridge::ClassInspection{};
+    detail_.started = std::chrono::steady_clock::now();
+    selected_class_ = class_name;
+
+    // Reset per-class instance state.
+    instances_.clear();
+    selected_instance_ = -1;
 
     MessageRouter::instance().post_command(
         "bridge.class.inspect",
         nlohmann::json{{"className", class_name}},
         [this, class_name](bool ok, const nlohmann::json& reply) {
             marshal_to_ui([this, class_name, ok, reply]() {
-                // Ignore stale replies for a class the user already switched away from.
                 if (detail_.class_name != class_name) return;
-
                 detail_.loading = false;
                 if (!ok) {
                     detail_.error = reply.value("error", std::string("unknown"));
@@ -148,53 +181,48 @@ void ClassBrowserTab::check_timeouts() {
         detail_.loading = false;
         detail_.error   = "timeout";
     }
+    if (method_search_.running &&
+        now - method_search_.started > std::chrono::seconds(kTimeoutSeconds)) {
+        method_search_.running = false;
+        method_search_.error   = "timeout";
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Draw
+//  Top-level draw
 // ═══════════════════════════════════════════════════════════════
 
 void ClassBrowserTab::draw() {
     check_timeouts();
 
-    // Trigger refresh on filter change.
     if (std::strcmp(filter_buf_, last_filter_.c_str()) != 0 && !list_.loading) {
         refresh_list();
     }
 
-    // ── Global method search bar ────────────────────────────
-    draw_method_search_section();
-
-    // ── Top toolbar ──
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 120.0f);
-    ImGui::InputTextWithHint(
-        "##filter",
-        "Filter: substring, wildcard (*Bundle*), or regex (/^android\\./i)",
-        filter_buf_, sizeof(filter_buf_));
-    ImGui::SameLine();
-    if (ImGui::Button("Refresh") && !list_.loading) {
-        refresh_list();
-    }
-
-    if (list_.loading) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("loading…");
-    } else if (!list_.error.empty()) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "error: %s",
-                           list_.error.c_str());
-    }
-
-    ImGui::Separator();
+    draw_method_search_bar();
 
     // ── Split: tree | details ──
-    float avail = ImGui::GetContentRegionAvail().x;
+    float avail  = ImGui::GetContentRegionAvail().x;
     float left_w = avail * 0.42f;
-    if (left_w < 240.0f) left_w = 240.0f;
-    if (left_w > avail - 240.0f) left_w = avail - 240.0f;
+    if (left_w < 240.0f)         left_w = 240.0f;
+    if (left_w > avail - 300.0f) left_w = avail - 300.0f;
 
     ImGui::BeginChild("##cb_left", ImVec2(left_w, 0), ImGuiChildFlags_None);
     {
+        // Filter input lives inside the left panel.
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint(
+            "##filter",
+            "substring | *wildcard* | /regex/i",
+            filter_buf_, sizeof(filter_buf_));
+        if (ImGui::Button("Refresh")) refresh_list();
+        if (list_.loading) { ImGui::SameLine(); ImGui::TextDisabled("loading…"); }
+        else if (!list_.error.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                               "err: %s", list_.error.c_str());
+        }
+
         tree_.set_filter(filter_buf_);
         bool changed = tree_.draw("##cb_tree", 0.0f);
         if (changed) {
@@ -213,6 +241,10 @@ void ClassBrowserTab::draw() {
     ImGui::EndChild();
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  Details panel
+// ═══════════════════════════════════════════════════════════════
+
 void ClassBrowserTab::draw_details() {
     if (detail_.class_name.empty()) {
         ImGui::TextDisabled("Select a class to inspect.");
@@ -222,242 +254,344 @@ void ClassBrowserTab::draw_details() {
     ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f), "%s",
                        detail_.class_name.c_str());
 
-    if (detail_.loading) {
-        ImGui::TextDisabled("loading…");
-        return;
-    }
+    if (detail_.loading) { ImGui::TextDisabled("loading…"); return; }
     if (!detail_.error.empty()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "error: %s",
-                           detail_.error.c_str());
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                           "error: %s", detail_.error.c_str());
         return;
     }
 
     const auto& insp = detail_.inspection;
 
+    // ── Instances section first (users need one before instance calls) ──
+    draw_instances_section();
+
     // ── Constructors ──
     if (!insp.constructors.empty()) {
-        if (ImGui::CollapsingHeader("Constructors",
-                ImGuiTreeNodeFlags_DefaultOpen)) {
-            for (size_t i = 0; i < insp.constructors.size(); i++) {
-                const auto& c = insp.constructors[i];
-                ImGui::PushID((int)i);
-
-                ImGui::TextUnformatted("$new(");
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f),
+                           "Constructors (%zu)", insp.constructors.size());
+        for (size_t i = 0; i < insp.constructors.size(); i++) {
+            const auto& c = insp.constructors[i];
+            ImGui::PushID((int)i);
+            ImGui::TextUnformatted("$new(");
+            ImGui::SameLine();
+            for (size_t j = 0; j < c.argumentTypes.size(); j++) {
+                if (j) { ImGui::SameLine(); ImGui::TextUnformatted(", "); ImGui::SameLine(); }
+                ImGui::TextColored(ImVec4(0.65f, 0.85f, 1.0f, 1.0f),
+                                   "%s", c.argumentTypes[j].c_str());
                 ImGui::SameLine();
-                for (size_t j = 0; j < c.argumentTypes.size(); j++) {
-                    if (j) { ImGui::SameLine(); ImGui::TextUnformatted(", "); ImGui::SameLine(); }
-                    ImGui::TextColored(ImVec4(0.65f, 0.85f, 1.0f, 1.0f),
-                                       "%s", c.argumentTypes[j].c_str());
-                    ImGui::SameLine();
-                }
-                ImGui::TextUnformatted(")");
-
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Call…")) {
-                    CallPanelTab::instance().prepare_call(
-                        detail_.class_name, "$new", c.argumentTypes, /*is_static=*/false);
-                    MainWindow::instance().select_tab(2);
-                }
-                ImGui::PopID();
             }
+            ImGui::TextUnformatted(")");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("create")) create_instance(c);
+            ImGui::PopID();
         }
     }
 
-    // ── Methods ──
+    // ── Methods (main focus) ──
     if (!insp.methods.empty()) {
-        if (ImGui::CollapsingHeader("Methods",
-                ImGuiTreeNodeFlags_DefaultOpen)) {
-            for (size_t i = 0; i < insp.methods.size(); i++) {
-                const auto& m = insp.methods[i];
-                ImGui::PushID((int)i);
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f),
+                           "Methods (%zu)", insp.methods.size());
 
-                ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f),
-                                   "%s", m.returnType.c_str());
-                ImGui::SameLine();
-                ImGui::Text("%s(", m.name.c_str());
-                ImGui::SameLine();
-                for (size_t j = 0; j < m.argumentTypes.size(); j++) {
-                    if (j) { ImGui::SameLine(); ImGui::TextUnformatted(", "); ImGui::SameLine(); }
-                    ImGui::TextColored(ImVec4(0.65f, 0.85f, 1.0f, 1.0f),
-                                       "%s", m.argumentTypes[j].c_str());
-                    ImGui::SameLine();
-                }
-                ImGui::TextUnformatted(")");
+        ImGui::BeginChild("##methods", ImVec2(0, 380), ImGuiChildFlags_Borders);
+        for (size_t i = 0; i < insp.methods.size(); i++) {
+            const auto& m = insp.methods[i];
+            ImGui::PushID((int)i);
 
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Hook")) {
-                    HookEditorTab::instance().prepare_hook(
-                        detail_.class_name, m.name, m.argumentTypes);
-                    MainWindow::instance().select_tab(1);
-                }
-                ImGui::SameLine();
-                bool is_static = (m.type == "static");
-                if (ImGui::SmallButton("Call…")) {
-                    CallPanelTab::instance().prepare_call(
-                        detail_.class_name, m.name, m.argumentTypes, is_static);
-                    MainWindow::instance().select_tab(2);
-                }
+            std::string key = make_method_key(detail_.class_name, m.name,
+                                              m.argumentTypes);
+            MethodHookState& state = method_hooks_[key];
+            bool hooked = state.active;
 
-                ImGui::PopID();
+            // Colored signature while traced.
+            if (hooked) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.78f, 0.30f, 1.0f));
             }
+            ImGui::Text("%s", m.returnType.c_str());
+            ImGui::SameLine();
+            ImGui::Text("%s(", m.name.c_str());
+            ImGui::SameLine();
+            for (size_t j = 0; j < m.argumentTypes.size(); j++) {
+                if (j) { ImGui::SameLine(); ImGui::TextUnformatted(", "); ImGui::SameLine(); }
+                ImGui::TextColored(ImVec4(0.65f, 0.85f, 1.0f, 1.0f),
+                                   "%s", m.argumentTypes[j].c_str());
+                ImGui::SameLine();
+            }
+            ImGui::TextUnformatted(")");
+            if (hooked) ImGui::PopStyleColor();
+
+            if (state.call_count > 0) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f),
+                                   "(%u)", state.call_count);
+            }
+
+            ImGui::SameLine();
+            if (hooked) {
+                if (ImGui::SmallButton("untrace")) {
+                    std::string err;
+                    if (bridge::HookManager::instance().uninstall(
+                            state.hook_id, err, 3000)) {
+                        state.active    = false;
+                        state.hook_id   = 0;
+                    } else {
+                        Notification::instance().push(
+                            "untrace failed: " + err, 4.0f);
+                    }
+                }
+            } else {
+                if (ImGui::SmallButton("trace")) toggle_trace(m);
+            }
+
+            bool is_static = (m.type == "static");
+            bool can_call  = is_static || (selected_instance_ >= 0);
+            ImGui::SameLine();
+            if (!can_call) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("call")) call_method(m);
+            if (!can_call) ImGui::EndDisabled();
+
+            if (!can_call) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(select an instance first)");
+            }
+
+            ImGui::PopID();
         }
+        ImGui::EndChild();
     }
 
     // ── Fields ──
     if (!insp.fields.empty()) {
-        if (ImGui::CollapsingHeader("Fields",
-                ImGuiTreeNodeFlags_DefaultOpen)) {
-            for (size_t i = 0; i < insp.fields.size(); i++) {
-                const auto& f = insp.fields[i];
-                ImGui::PushID((int)i);
-
-                ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f),
-                                   "%s", f.type.c_str());
-                ImGui::SameLine();
-                ImGui::Text("%s", f.name.c_str());
-
-                ImGui::PopID();
-            }
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f),
+                           "Fields (%zu)", insp.fields.size());
+        for (size_t i = 0; i < insp.fields.size(); i++) {
+            const auto& f = insp.fields[i];
+            ImGui::PushID((int)i);
+            ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f),
+                               "%s", f.type.c_str());
+            ImGui::SameLine();
+            ImGui::Text("%s", f.name.c_str());
+            ImGui::PopID();
         }
     }
 
-    if (insp.constructors.empty() && insp.methods.empty() && insp.fields.empty()) {
+    if (insp.methods.empty() && insp.fields.empty() &&
+        insp.constructors.empty()) {
         ImGui::TextDisabled("(no members visible via Java.use)");
     }
-
-    // Instance search lives at the bottom of the details panel so it
-    // always refers to the currently selected class.
-    draw_instance_search_section();
 }
-
-
 
 // ═══════════════════════════════════════════════════════════════
-//  Instance search (heap.choose via strategy)
+//  Instance acquisition
 // ═══════════════════════════════════════════════════════════════
 
-void ClassBrowserTab::start_instance_search() {
-    if (detail_.class_name.empty() || instance_search_.running) return;
-
-    instance_search_.running       = true;
-    instance_search_.total_matches = 0;
-    instance_search_.error.clear();
-    instance_search_.matches.clear();
-    instance_search_.started = std::chrono::steady_clock::now();
-
-    art::ChooseStrategy strategy = art::ChooseStrategy::Auto;
-    if (instance_search_.strategy == 1) strategy = art::ChooseStrategy::Jvmti;
-    if (instance_search_.strategy == 2) strategy = art::ChooseStrategy::Jvmti;  // GetInstances falls back to JVMTI
-
-    std::string error;
-    uint64_t id = art::HeapScanner::instance().choose(
-        detail_.class_name,
-        [this](const art::HeapMatch& m) {
-            marshal_to_ui([this, m]() {
-                instance_search_.total_matches++;
-                InstanceSearchState::Match rec;
-                rec.handle  = m.handle;
-                rec.display = m.stringRep;
-                instance_search_.matches.push_back(std::move(rec));
-            });
-        },
-        [this](uint64_t /*id*/, bool /*aborted*/) {
-            marshal_to_ui([this]() {
-                instance_search_.running = false;
-            });
-        },
-        error,
-        10000,
-        strategy);
-
-    if (id == 0) {
-        instance_search_.running = false;
-        instance_search_.error   = error;
-    } else {
-        instance_search_.session_id = id;
-    }
-}
-
-void ClassBrowserTab::stop_instance_search() {
-    if (!instance_search_.running || instance_search_.session_id == 0) return;
-    art::HeapScanner::instance().cancel(instance_search_.session_id);
-    instance_search_.session_id = 0;
-}
-
-void ClassBrowserTab::draw_instance_search_section() {
+void ClassBrowserTab::draw_instances_section() {
     ImGui::Separator();
     ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f),
-                       "Instance search — %s", detail_.class_name.c_str());
+                       "Instances (%zu)", instances_.size());
 
-    // Strategy dropdown.
     const char* strategies[] = { "Auto", "JVMTI", "GetInstances" };
-    ImGui::SetNextItemWidth(180.0f);
-    ImGui::Combo("##strategy", &instance_search_.strategy,
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::Combo("##strategy", &instance_search_strategy_,
                  strategies, IM_ARRAYSIZE(strategies));
-
     ImGui::SameLine();
 
-    if (instance_search_.running) {
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - instance_search_.started).count();
-        ImGui::TextDisabled("searching… %d found, %llds",
-                            instance_search_.total_matches, (long long)elapsed);
+    if (instance_search_running_) {
+        ImGui::TextDisabled("searching…");
         ImGui::SameLine();
-        if (ImGui::Button("Stop")) stop_instance_search();
+        if (ImGui::SmallButton("Stop")) stop_instance_search();
     } else {
-        if (ImGui::Button("Find instances")) start_instance_search();
+        if (ImGui::SmallButton("Find instances")) find_instances();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear")) {
+            instances_.clear();
+            selected_instance_ = -1;
+            instance_search_error_.clear();
+        }
     }
 
-    if (!instance_search_.error.empty()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "error: %s",
-                           instance_search_.error.c_str());
+    if (!instance_search_error_.empty()) {
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                           "error: %s", instance_search_error_.c_str());
     }
 
-    if (!instance_search_.matches.empty()) {
-        ImGui::BeginChild("##instance_results",
-                          ImVec2(0, 240), ImGuiChildFlags_Border);
-        for (size_t i = 0; i < instance_search_.matches.size(); i++) {
-            const auto& m = instance_search_.matches[i];
+    if (!instances_.empty()) {
+        ImGui::BeginChild("##instances", ImVec2(0, 140), ImGuiChildFlags_Borders);
+        for (size_t i = 0; i < instances_.size(); i++) {
+            const auto& inst = instances_[i];
             ImGui::PushID((int)i);
-
-            // Wrap in a selectable so the user can highlight one for
-            // hooking/calling from the other tabs.
-            std::string label = m.display.empty()
-                ? m.handle
-                : (m.display + "  [" + m.handle.substr(0, 12) + "…]");
-            if (ImGui::Selectable(label.c_str())) {
-                // Selecting a handle copies it to the "thisHandle" field
-                // of CallPanelTab so the user can invoke methods on it.
-                std::snprintf(CallPanelTab::instance().this_handle_buf_for_ui(),
-                              sizeof(CallPanelTab::instance().this_handle_buf_for_ui()),
-                              "%s", m.handle.c_str());
-                MainWindow::instance().select_tab(2);
+            bool is_selected = (selected_instance_ == (int)i);
+            if (ImGui::RadioButton("##sel", is_selected)) {
+                selected_instance_ = (int)i;
             }
             ImGui::SameLine();
-            if (ImGui::SmallButton("Release")) {
-                std::string err;
-                bridge::HandleRegistry::instance().release(m.handle, err, 2000);
-                instance_search_.matches.erase(instance_search_.matches.begin() + i);
-                ImGui::PopID();
-                break;
+            std::string label = inst.display.empty()
+                ? ("<" + detail_.class_name + ">")
+                : inst.display;
+            if (ImGui::Selectable(label.c_str(), is_selected)) {
+                selected_instance_ = (int)i;
             }
+            ImGui::SameLine();
+            ImGui::TextDisabled("handle=%s…",
+                                inst.handle.substr(0, 12).c_str());
             ImGui::PopID();
         }
         ImGui::EndChild();
     }
 }
 
+void ClassBrowserTab::find_instances() {
+    if (instance_search_running_ || detail_.class_name.empty()) return;
+
+    instance_search_running_ = true;
+    instance_search_error_.clear();
+    instances_.clear();
+    selected_instance_ = -1;
+
+    art::ChooseStrategy strategy = art::ChooseStrategy::Auto;
+    if (instance_search_strategy_ == 1) strategy = art::ChooseStrategy::Jvmti;
+    if (instance_search_strategy_ == 2) strategy = art::ChooseStrategy::Jvmti;
+
+    std::string error;
+    uint64_t id = art::HeapScanner::instance().choose(
+        detail_.class_name,
+        [this](const art::HeapMatch& m) {
+            marshal_to_ui([this, m]() {
+                instances_.push_back({m.handle, m.stringRep});
+            });
+        },
+        [this](uint64_t, bool) {
+            marshal_to_ui([this]() { instance_search_running_ = false; });
+        },
+        error,
+        5000,
+        strategy);
+
+    if (id == 0) {
+        instance_search_running_ = false;
+        instance_search_error_ = error;
+    } else {
+        instance_search_id_ = id;
+    }
+}
+
+void ClassBrowserTab::stop_instance_search() {
+    if (!instance_search_running_) return;
+    if (instance_search_id_ != 0) {
+        art::HeapScanner::instance().cancel(instance_search_id_);
+        instance_search_id_ = 0;
+    }
+    instance_search_running_ = false;
+}
+
 // ═══════════════════════════════════════════════════════════════
-//  Method search (Java.enumerateMethods)
+//  Trace toggle
 // ═══════════════════════════════════════════════════════════════
+
+void ClassBrowserTab::toggle_trace(const bridge::MethodSignature& m) {
+    std::string key = make_method_key(detail_.class_name, m.name, m.argumentTypes);
+    auto& state = method_hooks_[key];
+    if (state.active) return;
+
+    std::string error;
+    uint64_t hook_id = bridge::HookManager::instance().install(
+        detail_.class_name, m.name, m.argumentTypes,
+        // Per-hook enter callback: increments this method's counter.
+        [this, key](const bridge::HookEnterEvent&) {
+            marshal_to_ui([this, key]() {
+                auto it = method_hooks_.find(key);
+                if (it != method_hooks_.end()) {
+                    it->second.call_count++;
+                }
+            });
+        },
+        nullptr,
+        error,
+        5000);
+
+    if (hook_id == 0) {
+        Notification::instance().push("trace failed: " + error, 4.0f);
+        return;
+    }
+    state.hook_id    = hook_id;
+    state.active     = true;
+    state.call_count = 0;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Call / create
+// ═══════════════════════════════════════════════════════════════
+
+void ClassBrowserTab::call_method(const bridge::MethodSignature& m) {
+    std::string this_handle;
+    if (m.type != "static" && selected_instance_ >= 0) {
+        this_handle = instances_[selected_instance_].handle;
+    }
+    CallPanelTab::instance().prepare_call(
+        detail_.class_name, m.name, m.argumentTypes,
+        m.type == "static", this_handle);
+    MainWindow::instance().select_tab(2);
+}
+
+void ClassBrowserTab::create_instance(const bridge::ConstructorSignature& ctor) {
+    CallPanelTab::instance().prepare_call(
+        detail_.class_name, "$new", ctor.argumentTypes,
+        false, "");
+    MainWindow::instance().select_tab(2);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Global method search
+// ═══════════════════════════════════════════════════════════════
+
+void ClassBrowserTab::draw_method_search_bar() {
+    ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f),
+                       "Global method search");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 220.0f);
+    ImGui::InputTextWithHint("##msearch",
+                             "com.example.*!onCreate   or   *!*",
+                             method_pattern_buf_,
+                             sizeof(method_pattern_buf_));
+    ImGui::SameLine();
+    if (method_search_.running) {
+        ImGui::TextDisabled("searching…");
+    } else {
+        if (ImGui::Button("Search")) start_method_search();
+    }
+
+    if (!method_search_.error.empty()) {
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                           "error: %s", method_search_.error.c_str());
+    }
+
+    if (!method_search_.matches.empty()) {
+        if (ImGui::CollapsingHeader("Search results")) {
+            ImGui::BeginChild("##mresults", ImVec2(0, 160),
+                              ImGuiChildFlags_Borders);
+            for (size_t i = 0; i < method_search_.matches.size(); i++) {
+                const auto& m = method_search_.matches[i];
+                ImGui::PushID((int)i);
+                std::string label = m.className + "." + m.methodName;
+                if (ImGui::Selectable(label.c_str())) show_class(m.className);
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+        }
+    }
+
+    ImGui::Separator();
+}
 
 void ClassBrowserTab::start_method_search() {
     if (method_search_.running) return;
-    method_search_.running = true;
+    method_search_.running  = true;
     method_search_.error.clear();
     method_search_.matches.clear();
-    method_search_.pattern = method_pattern_buf_;
-    method_search_.started = std::chrono::steady_clock::now();
+    method_search_.pattern  = method_pattern_buf_;
+    method_search_.started  = std::chrono::steady_clock::now();
 
     MessageRouter::instance().post_command(
         "bridge.class.enumerate_methods",
@@ -474,49 +608,11 @@ void ClassBrowserTab::start_method_search() {
                         MethodSearchState::Match rec;
                         rec.className  = m.value("className",  std::string());
                         rec.methodName = m.value("methodName", std::string());
-                        rec.loader     = m.value("loader",     std::string());
                         method_search_.matches.push_back(std::move(rec));
                     }
                 }
             });
         });
-}
-
-void ClassBrowserTab::draw_method_search_section() {
-    ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f), "Global method search");
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 220.0f);
-    ImGui::InputTextWithHint("##method_pattern",
-                             "pattern e.g. com.example.*!onCreate or *!*",
-                             method_pattern_buf_, sizeof(method_pattern_buf_));
-    ImGui::SameLine();
-    if (method_search_.running) {
-        ImGui::TextDisabled("searching…");
-    } else {
-        if (ImGui::Button("Search")) start_method_search();
-    }
-
-    if (!method_search_.error.empty()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "error: %s",
-                           method_search_.error.c_str());
-    }
-
-    if (!method_search_.matches.empty()) {
-        if (ImGui::CollapsingHeader("Search results")) {
-            ImGui::BeginChild("##method_results", ImVec2(0, 180), ImGuiChildFlags_Border);
-            for (size_t i = 0; i < method_search_.matches.size(); i++) {
-                const auto& m = method_search_.matches[i];
-                ImGui::PushID((int)i);
-                std::string label = m.className + "." + m.methodName;
-                if (ImGui::Selectable(label.c_str())) {
-                    show_class(m.className);
-                }
-                ImGui::PopID();
-            }
-            ImGui::EndChild();
-        }
-    }
-
-    ImGui::Separator();
 }
 
 } // namespace yamgg

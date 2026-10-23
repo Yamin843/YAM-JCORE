@@ -273,7 +273,7 @@ void HookEditorTab::draw_log() {
 
     ImGui::Separator();
 
-    ImGui::BeginChild("##log_scroll", ImVec2(0, 0), ImGuiChildFlags_Border);
+    ImGui::BeginChild("##log_scroll", ImVec2(0, 0), ImGuiChildFlags_Borders);
 
     std::deque<LogEntry> snapshot;
     {

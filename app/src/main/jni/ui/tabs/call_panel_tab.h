@@ -10,6 +10,7 @@
 #define YAMGG_UI_TABS_CALL_PANEL_TAB_H
 
 #include <chrono>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,15 @@ class CallPanelTab : public Tab {
 public:
     static CallPanelTab& instance();
 
+    using InstanceCreatedCallback =
+        std::function<void(const std::string& className,
+                           const std::string& handle)>;
+
+    // Register a callback invoked from the UI thread when create_instance
+    // succeeds. The class browser uses this to append the new instance
+    // to its own list.
+    void set_instance_created_callback(InstanceCreatedCallback cb);
+
     const char* name() const override { return "CL"; }
 
     void draw() override;
@@ -31,7 +41,8 @@ public:
     void prepare_call(const std::string& class_name,
                       const std::string& method_name,
                       const std::vector<std::string>& argument_types,
-                      bool is_static);
+                      bool is_static,
+                      const std::string& this_handle = std::string());
 
 public:
     // Exposes the this_handle buffer for other tabs (e.g. the class
@@ -90,6 +101,8 @@ private:
     };
     std::vector<HandleEntry>   handles_cache_;
     char                       handle_filter_buf_[128] = {0};
+
+    InstanceCreatedCallback    instance_created_cb_;
 };
 
 } // namespace yamgg

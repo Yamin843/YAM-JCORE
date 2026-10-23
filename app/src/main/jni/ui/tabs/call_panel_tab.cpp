@@ -2,6 +2,7 @@
 #include "ui/tabs/call_panel_tab.h"
 
 #include <cstdio>
+#include <thread>
 #include <cstring>
 
 #include "bridge/call_engine.h"
@@ -18,6 +19,10 @@ CallPanelTab& CallPanelTab::instance() {
     return t;
 }
 
+void CallPanelTab::set_instance_created_callback(InstanceCreatedCallback cb) {
+    instance_created_cb_ = std::move(cb);
+}
+
 char* CallPanelTab::this_handle_buf_for_ui() {
     return this_handle_buf_;
 }
@@ -25,7 +30,8 @@ char* CallPanelTab::this_handle_buf_for_ui() {
 void CallPanelTab::prepare_call(const std::string& class_name,
                                 const std::string& method_name,
                                 const std::vector<std::string>& argument_types,
-                                bool is_static) {
+                                bool is_static,
+                                const std::string& this_handle) {
     class_name_     = class_name;
     method_name_    = method_name;
     argument_types_ = argument_types;
@@ -34,6 +40,8 @@ void CallPanelTab::prepare_call(const std::string& class_name,
 
     std::snprintf(class_buf_,  sizeof(class_buf_),  "%s", class_name.c_str());
     std::snprintf(method_buf_, sizeof(method_buf_), "%s", method_name.c_str());
+    std::snprintf(this_handle_buf_, sizeof(this_handle_buf_), "%s",
+                  this_handle.c_str());
 
     arg_text_.assign(argument_types_.size(), std::string());
     has_result_ = false;
@@ -117,6 +125,14 @@ void CallPanelTab::invoke() {
                 if (result.is_object() && result.contains("handle") &&
                     result["handle"].is_string()) {
                     last_handle_ = result["handle"].get<std::string>();
+                    if (instance_created_cb_) {
+                        auto cb = instance_created_cb_;
+                        std::string cls_copy = class_name_;
+                        std::string h_copy = last_handle_;
+                        marshal_to_ui([cb, cls_copy, h_copy]() {
+                            cb(cls_copy, h_copy);
+                        });
+                    }
                 }
             } else {
                 result_value_ = nlohmann::json();

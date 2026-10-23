@@ -223,9 +223,9 @@ bool TreeView::draw(const char* id, float height) {
     if (id == nullptr || *id == '\0') id = "##tree";
 
     if (height > 0.0f) {
-        ImGui::BeginChild(id, ImVec2(0, height), ImGuiChildFlags_Border);
+        ImGui::BeginChild(id, ImVec2(0, height), ImGuiChildFlags_Borders);
     } else {
-        ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_Border);
+        ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_Borders);
     }
 
     bool selection_changed = false;

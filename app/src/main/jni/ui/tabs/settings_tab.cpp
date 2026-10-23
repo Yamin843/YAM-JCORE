@@ -232,7 +232,7 @@ void SettingsTab::draw_vm_info_section() {
                            vm_info_error_.c_str());
     }
     if (!vm_info_text_.empty()) {
-        ImGui::BeginChild("##vm_info", ImVec2(0, 160), ImGuiChildFlags_Border);
+        ImGui::BeginChild("##vm_info", ImVec2(0, 160), ImGuiChildFlags_Borders);
         ImGui::TextUnformatted(vm_info_text_.c_str());
         ImGui::EndChild();
     }
@@ -283,7 +283,7 @@ void SettingsTab::draw_classloaders_section() {
     }
 
     if (!loaders_cache_.empty()) {
-        ImGui::BeginChild("##loaders", ImVec2(0, 140), ImGuiChildFlags_Border);
+        ImGui::BeginChild("##loaders", ImVec2(0, 140), ImGuiChildFlags_Borders);
         for (size_t i = 0; i < loaders_cache_.size(); i++) {
             const auto& e = loaders_cache_[i];
             ImGui::PushID((int)i);
