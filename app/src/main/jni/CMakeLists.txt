@@ -43,6 +43,23 @@ set(JSON_DIR        "${ALL_LIBS_DIR}/json")
 set(GENERATED_DIR   "${JNI_DIR}/Generated")
 set(SCRIPTS_DIR     "${PROJECT_DIR}/scripts")
 
+# ─── Build-system check ───────────────────────────────────────
+# This project is built directly with CMake + the NDK toolchain
+# file. Gradle and the Android Gradle Plugin are NOT used. We require
+# the STL to be c++_shared because libyamjs.a bundles a c++_shared
+# binary that must match ours at link time.
+if(NOT DEFINED ANDROID_STL OR NOT ANDROID_STL STREQUAL "c++_shared")
+    message(WARNING
+        "ANDROID_STL is not 'c++_shared'. "
+        "Reconfigure with: -DANDROID_STL=c++_shared")
+endif()
+
+if(NOT DEFINED ANDROID_ABI)
+    message(WARNING
+        "ANDROID_ABI is not defined. "
+        "Reconfigure with: -DANDROID_ABI=arm64-v8a")
+endif()
+
 # ─── imgui sources ────────────────────────────────────────────
 # Core + OpenGL ES 3 backend. Desktop backends are excluded because
 # they target GLFW/SDL/etc. that are not available on Android.

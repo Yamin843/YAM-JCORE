@@ -18,7 +18,15 @@ jobs:
   build:
     name: Build shared library
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
+
+    env:
+      # Pin the NDK version. Changing this requires updating the path
+      # in the "Locate NDK" step and the ART offsets in
+      # scripts/lib/art_info.js.
+      NDK_VERSION: '25.2.9519653'
+      ABI: 'arm64-v8a'
+      API: '24'
 
     steps:
       - name: Checkout
@@ -34,13 +42,13 @@ jobs:
           ./scripts/reassemble_lib.sh
           ls -lh app/src/main/jni/all_libs/LIBYAMJS/libyamjs.a
 
-      - name: Set up JDK 17
+      - name: Set up JDK 17 (for javac, used by build_dex.sh)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK (only for d8 + android.jar)
         uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools'
@@ -53,62 +61,108 @@ jobs:
           sdkmanager --install \
               "build-tools;34.0.0" \
               "platforms;android-34" \
-              "ndk;25.2.9519653" \
+              "ndk;${NDK_VERSION}" \
               "cmake;3.22.1" \
               "platform-tools"
           sdkmanager --list_installed
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.4'
-
       - name: Generate JS headers
         shell: bash
         run: |
+          set -euo pipefail
           python3 --version
           python3 scripts/build_bootstrap.py
           ls -l app/src/main/jni/Generated/*.h
 
       - name: Generate embedded_dex.h
         shell: bash
-        continue-on-error: true
         run: |
+          set -euo pipefail
           chmod +x ./scripts/build_dex.sh
           ./scripts/build_dex.sh
           ls -l app/src/main/jni/Generated/embedded_dex.h
 
-      - name: Build shared library only
+      - name: Locate NDK
         shell: bash
         run: |
           set -euo pipefail
-          gradle :app:externalNativeBuildDebug \
-              --stacktrace --no-daemon --console=plain
-
-      - name: Locate libyamgg.so
-        if: success()
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "=== Searching for libyamgg.so ==="
-          FOUND=$(find app/build -type f -name 'libyamgg.so' | head -1)
-          if [ -z "$FOUND" ]; then
-              echo "::error::libyamgg.so was not produced"
-              find app/build -type f -name '*.so' -print
+          NDK_DIR="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/${NDK_VERSION}"
+          if [ ! -d "$NDK_DIR" ]; then
+              echo "::error::NDK not found at $NDK_DIR"
+              ls -la "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/" || true
               exit 1
           fi
-          echo "Found: $FOUND"
-          ls -lh "$FOUND"
-          echo "=== All .so files ==="
-          find app/build -type f -name '*.so' -print
+          echo "NDK_DIR=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "✓ NDK at $NDK_DIR"
+
+      - name: Locate CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The SDK-installed cmake is preferred because it matches the
+          # version pinned by the project (3.22.1). If absent, fall back
+          # to the system cmake.
+          SDK_CMAKE_DIR="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/cmake/3.22.1/bin"
+          if [ -x "$SDK_CMAKE_DIR/cmake" ]; then
+              echo "CMAKE_BIN=$SDK_CMAKE_DIR/cmake" >> "$GITHUB_ENV"
+          else
+              echo "CMAKE_BIN=$(command -v cmake)" >> "$GITHUB_ENV"
+          fi
+          "$CMAKE_BIN" --version || command -v cmake --version
+
+      - name: Configure CMake (standalone, NDK toolchain)
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CMAKE_BIN" \
+              -S app/src/main/jni \
+              -B build/so \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK_DIR/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="$ABI" \
+              -DANDROID_PLATFORM="android-$API" \
+              -DANDROID_STL=c++_shared \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DANDROID_NDK="$NDK_DIR"
+
+      - name: Build libyamgg.so
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CMAKE_BIN" --build build/so --target yamgg -j"$(nproc)" --verbose
+
+      - name: Locate libyamgg.so
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== Files in build/so ==="
+          find build/so -type f -name '*.so' -print
+
+          SO="$(find build/so -type f -name 'libyamgg.so' | head -1)"
+          if [ -z "$SO" ]; then
+              echo "::error::libyamgg.so was not produced"
+              find build/so -type f -name '*.so' -exec file {} \;
+              exit 1
+          fi
+          echo "SO_PATH=$SO" >> "$GITHUB_ENV"
+          echo "=== $SO ==="
+          ls -lh "$SO"
+          file "$SO"
+          echo ""
+          echo "=== JNI_OnLoad export check ==="
+          nm -D "$SO" | grep -E 'JNI_OnLoad|JNI_OnUnload' || {
+              echo "::error::JNI_OnLoad not exported"
+              exit 1
+          }
+          echo ""
+          echo "=== Needed libraries ==="
+          readelf -d "$SO" | grep -E 'NEEDED' || true
 
       - name: Upload libyamgg.so
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: libyamgg.so
-          path: |
-            app/build/**/libyamgg.so
+          name: libyamgg-so
+          path: ${{ env.SO_PATH }}
           if-no-files-found: error
           retention-days: 30
 
@@ -118,7 +172,8 @@ jobs:
         with:
           name: build-logs
           path: |
-            app/build/reports/
-            app/build/outputs/logs/
+            build/so/CMakeFiles/CMakeOutput.log
+            build/so/CMakeFiles/CMakeError.log
+            build/so/.ninja_log
           if-no-files-found: ignore
           retention-days: 7
