@@ -85,7 +85,10 @@ MainWindow& MainWindow::instance() {
 }
 
 MainWindow::MainWindow() : impl_(new Impl()) {}
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow() {
+    delete impl_;
+    impl_ = nullptr;
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  Public API

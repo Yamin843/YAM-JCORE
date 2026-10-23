@@ -6,11 +6,13 @@
 //   1 = HookEditorTab
 //   2 = CallPanelTab
 //   3 = SettingsTab
+//   4 = RegisterClassTab
 //
 // Tabs are singletons and outlive TabRegistry. We wrap them in a
 // shared_ptr whose deleter is a no-op — the singleton owns itself.
 #include "ui/main_window.h"
 #include "ui/tabs/call_panel_tab.h"
+#include "ui/tabs/register_class_tab.h"
 #include "ui/tabs/class_browser_tab.h"
 #include "ui/tabs/hook_editor_tab.h"
 #include "ui/tabs/settings_tab.h"
@@ -40,6 +42,7 @@ void register_all_default_tabs() {
     add(&HookEditorTab::instance());
     add(&CallPanelTab::instance());
     add(&SettingsTab::instance());
+    add(&RegisterClassTab::instance());
 }
 
 } // namespace yamgg

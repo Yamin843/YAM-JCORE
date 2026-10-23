@@ -68,7 +68,7 @@ public:
 
 private:
     MainWindow();
-    ~MainWindow() = default;
+    ~MainWindow();
 
     MainWindow(const MainWindow&) = delete;
     MainWindow& operator=(const MainWindow&) = delete;

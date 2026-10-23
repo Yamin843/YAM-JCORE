@@ -290,4 +290,12 @@ void CallPanelTab::draw_handles_section() {
     }
 }
 
+
+// Free function so other translation units (e.g. RegisterClassTab) can
+// copy a handle string into the CallPanelTab's this_handle buffer without
+// needing the CallPanelTab header.
+extern "C" char* yamgg_call_panel_this_handle_buf() {
+    return CallPanelTab::instance().this_handle_buf_for_ui();
+}
+
 } // namespace yamgg

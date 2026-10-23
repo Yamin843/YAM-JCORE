@@ -7,6 +7,10 @@
 #include "core/message_router.h"
 #include "core/thread_sync.h"
 #include "core/error_recovery.h"
+#include "core/message_router.h"
+#include "core/thread_sync.h"
+
+#include <json.hpp>
 #include "imgui.h"
 #include "ui/main_window.h"
 #include "ui/theme.h"
@@ -24,6 +28,12 @@ void SettingsTab::draw() {
     draw_capabilities_section();
     ImGui::Separator();
     draw_deoptimize_section();
+    ImGui::Separator();
+    draw_vm_info_section();
+    ImGui::Separator();
+    draw_classloaders_section();
+    ImGui::Separator();
+    draw_open_class_file_section();
     ImGui::Separator();
     draw_handles_section();
     ImGui::Separator();
@@ -181,6 +191,164 @@ void SettingsTab::draw_ui_section() {
     bool full = MainWindow::instance().is_fullscreen();
     if (ImGui::Checkbox("Fullscreen", &full)) {
         MainWindow::instance().set_fullscreen(full);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  VM info
+// ═══════════════════════════════════════════════════════════════
+
+void SettingsTab::draw_vm_info_section() {
+    ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f), "Java VM Info");
+
+    if (ImGui::Button("Query VM info")) {
+        vm_info_requested_ = true;
+        vm_info_text_.clear();
+        vm_info_error_.clear();
+        MessageRouter::instance().post_command(
+            "bridge.java.vm_info",
+            nlohmann::json::object(),
+            [this](bool ok, const nlohmann::json& reply) {
+                marshal_to_ui([this, ok, reply]() {
+                    vm_info_requested_ = false;
+                    if (!ok) {
+                        vm_info_error_ = reply.value("error", std::string("unknown"));
+                        return;
+                    }
+                    try { vm_info_text_ = reply.dump(2); }
+                    catch (...) { vm_info_text_ = "<unparseable>"; }
+                });
+            });
+    }
+
+    if (vm_info_requested_) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("querying…");
+    }
+
+    if (!vm_info_error_.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "error: %s",
+                           vm_info_error_.c_str());
+    }
+    if (!vm_info_text_.empty()) {
+        ImGui::BeginChild("##vm_info", ImVec2(0, 160), ImGuiChildFlags_Border);
+        ImGui::TextUnformatted(vm_info_text_.c_str());
+        ImGui::EndChild();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Class loaders
+// ═══════════════════════════════════════════════════════════════
+
+void SettingsTab::draw_classloaders_section() {
+    ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f),
+                       "Class Loaders (%zu)", loaders_cache_.size());
+
+    if (ImGui::Button("Refresh loaders")) {
+        loaders_loading_ = true;
+        loaders_error_.clear();
+        MessageRouter::instance().post_command(
+            "bridge.classloaders.list",
+            nlohmann::json::object(),
+            [this](bool ok, const nlohmann::json& reply) {
+                marshal_to_ui([this, ok, reply]() {
+                    loaders_loading_ = false;
+                    if (!ok) {
+                        loaders_error_ = reply.value("error", std::string("unknown"));
+                        return;
+                    }
+                    loaders_cache_.clear();
+                    if (reply.contains("loaders") && reply["loaders"].is_array()) {
+                        for (const auto& e : reply["loaders"]) {
+                            LoaderEntry rec;
+                            rec.handle      = e.value("handle", std::string());
+                            rec.description = e.value("description", std::string());
+                            loaders_cache_.push_back(std::move(rec));
+                        }
+                    }
+                });
+            });
+    }
+
+    if (loaders_loading_) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("loading…");
+    }
+
+    if (!loaders_error_.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "error: %s",
+                           loaders_error_.c_str());
+    }
+
+    if (!loaders_cache_.empty()) {
+        ImGui::BeginChild("##loaders", ImVec2(0, 140), ImGuiChildFlags_Border);
+        for (size_t i = 0; i < loaders_cache_.size(); i++) {
+            const auto& e = loaders_cache_[i];
+            ImGui::PushID((int)i);
+            ImGui::Text("%zu. %s", i, e.description.c_str());
+            if (!e.handle.empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Use in factory")) {
+                    // Create a ClassFactory bound to this loader.
+                    nlohmann::json args = {{"loaderHandle", e.handle}};
+                    MessageRouter::instance().post_command(
+                        "bridge.java.new_class_factory", args,
+                        [](bool ok2, const nlohmann::json& reply2) {
+                            if (!ok2) return;
+                            // Report success via log.
+                        });
+                }
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Open class file (Java.openClassFile)
+// ═══════════════════════════════════════════════════════════════
+
+void SettingsTab::draw_open_class_file_section() {
+    ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f),
+                       "Open Class File (DEX)");
+
+    ImGui::TextDisabled("Path to a DEX file on the device:");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText("##dex_path", open_dex_path_buf_,
+                     sizeof(open_dex_path_buf_));
+
+    if (open_dex_in_flight_) {
+        ImGui::TextDisabled("loading…");
+    } else {
+        if (ImGui::Button("Load DEX")) {
+            if (open_dex_path_buf_[0] != '\0') {
+                open_dex_in_flight_ = true;
+                open_dex_result_.clear();
+                nlohmann::json args = {{"path", std::string(open_dex_path_buf_)}};
+                MessageRouter::instance().post_command(
+                    "bridge.java.open_class_file", args,
+                    [this](bool ok, const nlohmann::json& reply) {
+                        marshal_to_ui([this, ok, reply]() {
+                            open_dex_in_flight_ = false;
+                            if (!ok) {
+                                open_dex_result_ = "error: " +
+                                    reply.value("error", std::string("unknown"));
+                                return;
+                            }
+                            open_dex_result_ =
+                                "loaded; handle = " +
+                                reply.value("handle", std::string());
+                        });
+                    });
+            }
+        }
+    }
+
+    if (!open_dex_result_.empty()) {
+        ImGui::TextWrapped("%s", open_dex_result_.c_str());
     }
 }
 
