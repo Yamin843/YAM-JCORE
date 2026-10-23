@@ -21,9 +21,6 @@ jobs:
     timeout-minutes: 60
 
     env:
-      # Pin the NDK version. Changing this requires updating the path
-      # in the "Locate NDK" step and the ART offsets in
-      # scripts/lib/art_info.js.
       NDK_VERSION: '25.2.9519653'
       ABI: 'arm64-v8a'
       API: '24'
@@ -42,13 +39,13 @@ jobs:
           ./scripts/reassemble_lib.sh
           ls -lh app/src/main/jni/all_libs/LIBYAMJS/libyamjs.a
 
-      - name: Set up JDK 17 (for javac, used by build_dex.sh)
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK (only for d8 + android.jar)
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools'
@@ -86,31 +83,40 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          NDK_DIR="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/${NDK_VERSION}"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_ROOT" ]; then
+              echo "::error::Neither ANDROID_SDK_ROOT nor ANDROID_HOME is set"
+              exit 1
+          fi
+          NDK_DIR="$SDK_ROOT/ndk/${NDK_VERSION}"
           if [ ! -d "$NDK_DIR" ]; then
               echo "::error::NDK not found at $NDK_DIR"
-              ls -la "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/" || true
+              ls -la "$SDK_ROOT/ndk/" 2>/dev/null || true
               exit 1
           fi
           echo "NDK_DIR=$NDK_DIR" >> "$GITHUB_ENV"
-          echo "✓ NDK at $NDK_DIR"
+          echo "✓ NDK: $NDK_DIR"
 
       - name: Locate CMake
         shell: bash
         run: |
           set -euo pipefail
-          # The SDK-installed cmake is preferred because it matches the
-          # version pinned by the project (3.22.1). If absent, fall back
-          # to the system cmake.
-          SDK_CMAKE_DIR="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/cmake/3.22.1/bin"
-          if [ -x "$SDK_CMAKE_DIR/cmake" ]; then
-              echo "CMAKE_BIN=$SDK_CMAKE_DIR/cmake" >> "$GITHUB_ENV"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          CMAKE_CANDIDATE="$SDK_ROOT/cmake/3.22.1/bin/cmake"
+          if [ -x "$CMAKE_CANDIDATE" ]; then
+              CMAKE_USE="$CMAKE_CANDIDATE"
           else
-              echo "CMAKE_BIN=$(command -v cmake)" >> "$GITHUB_ENV"
+              CMAKE_USE="$(command -v cmake || true)"
           fi
-          "$CMAKE_BIN" --version || command -v cmake --version
+          if [ -z "${CMAKE_USE:-}" ] || [ ! -x "$CMAKE_USE" ]; then
+              echo "::error::No usable cmake binary found"
+              echo "  candidate: $CMAKE_CANDIDATE"
+              exit 1
+          fi
+          echo "CMAKE_BIN=$CMAKE_USE" >> "$GITHUB_ENV"
+          "$CMAKE_USE" --version
 
-      - name: Configure CMake (standalone, NDK toolchain)
+      - name: Configure CMake
         shell: bash
         run: |
           set -euo pipefail
@@ -128,34 +134,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          "$CMAKE_BIN" --build build/so --target yamgg -j"$(nproc)" --verbose
+          "$CMAKE_BIN" --build build/so --target yamgg -j"$(nproc)"
 
-      - name: Locate libyamgg.so
+      - name: Verify output
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== Files in build/so ==="
+          echo "=== .so files produced ==="
           find build/so -type f -name '*.so' -print
 
           SO="$(find build/so -type f -name 'libyamgg.so' | head -1)"
           if [ -z "$SO" ]; then
               echo "::error::libyamgg.so was not produced"
-              find build/so -type f -name '*.so' -exec file {} \;
               exit 1
           fi
           echo "SO_PATH=$SO" >> "$GITHUB_ENV"
-          echo "=== $SO ==="
           ls -lh "$SO"
           file "$SO"
           echo ""
-          echo "=== JNI_OnLoad export check ==="
+          echo "=== JNI exports ==="
           nm -D "$SO" | grep -E 'JNI_OnLoad|JNI_OnUnload' || {
               echo "::error::JNI_OnLoad not exported"
               exit 1
           }
           echo ""
-          echo "=== Needed libraries ==="
-          readelf -d "$SO" | grep -E 'NEEDED' || true
+          echo "=== NEEDED libraries ==="
+          readelf -d "$SO" | grep NEEDED || true
 
       - name: Upload libyamgg.so
         if: success()
@@ -166,7 +170,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload build logs on failure
+      - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
