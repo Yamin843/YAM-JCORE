@@ -1,16 +1,4 @@
-# .github/workflows/build.yml — CI for YAM-JCORE.
-#
-# Everything happens here: reassembling libyamjs.a from its parts,
-# generating the JS and DEX headers, and building the APK. The
-# developer only needs to push the repository from Termux with plain
-# git commands — no shell scripts, no chmod, no local build.
-#
-# We use the system `gradle` installed by gradle/actions/setup-gradle
-# instead of `./gradlew` because gradle-wrapper.jar is a binary and
-# is not committed (see .gitignore). This avoids the need for any
-# wrapper bootstrap step.
-
-name: Build APK
+name: Build shared library (.so)
 
 on:
   push:
@@ -27,83 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ─────────────────────────────────────────────────────────
-  #  Prepare: check libyamjs.a parts completeness
-  # ─────────────────────────────────────────────────────────
-  prepare:
-    name: Check libyamjs.a parts
-    runs-on: ubuntu-latest
-    outputs:
-      ready: ${{ steps.check.outputs.ready }}
-      part_count: ${{ steps.check.outputs.part_count }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Check parts completeness
-        id: check
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PARTS="app/src/main/jni/all_libs/LIBYAMJS/libyamjs.a.parts"
-          MERGED="app/src/main/jni/all_libs/LIBYAMJS/libyamjs.a"
-
-          if [ -f "$MERGED" ]; then
-              SIZE=$(stat -c%s "$MERGED")
-              if [ "$SIZE" -gt 1024 ]; then
-                  echo "ready=true"  >> "$GITHUB_OUTPUT"
-                  echo "part_count=0" >> "$GITHUB_OUTPUT"
-                  echo "::notice::libyamjs.a already present ($SIZE bytes)"
-                  exit 0
-              fi
-          fi
-
-          if [ ! -d "$PARTS" ] || [ ! -f "$PARTS/MANIFEST.txt" ]; then
-              echo "ready=false"  >> "$GITHUB_OUTPUT"
-              echo "part_count=0" >> "$GITHUB_OUTPUT"
-              echo "::warning::parts missing; skipping build"
-              exit 0
-          fi
-
-          COUNT=$(awk -F ': *' '$1=="part_count"{print $2; exit}'  "$PARTS/MANIFEST.txt")
-          PREFIX=$(awk -F ': *' '$1=="part_prefix"{print $2; exit}' "$PARTS/MANIFEST.txt")
-
-          if [ -z "$COUNT" ] || [ -z "$PREFIX" ]; then
-              echo "ready=false"  >> "$GITHUB_OUTPUT"
-              echo "part_count=0" >> "$GITHUB_OUTPUT"
-              echo "::warning::MANIFEST.txt malformed; skipping build"
-              exit 0
-          fi
-
-          MISSING=0
-          for i in $(seq 0 $((COUNT - 1))); do
-              P=$(printf "%s/%s%02d" "$PARTS" "$PREFIX" "$i")
-              if [ ! -f "$P" ]; then
-                  MISSING=$((MISSING + 1))
-                  echo "  missing: $P"
-              fi
-          done
-
-          echo "part_count=$COUNT" >> "$GITHUB_OUTPUT"
-
-          if [ "$MISSING" -gt 0 ]; then
-              echo "ready=false" >> "$GITHUB_OUTPUT"
-              echo "::warning::$MISSING of $COUNT parts missing; skipping build"
-          else
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "::notice::All $COUNT parts present; proceeding to build"
-          fi
-
-  # ─────────────────────────────────────────────────────────
-  #  Build: reassemble + generate + assemble APK
-  # ─────────────────────────────────────────────────────────
   build:
-    name: Build Debug APK
-    needs: prepare
-    if: needs.prepare.outputs.ready == 'true'
+    name: Build libyamgg.so
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -128,9 +41,9 @@ jobs:
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
-          log-accepted-android-sdk-licenses: false
+          packages: 'platform-tools'
 
       - name: Install Android SDK packages
         shell: bash
@@ -145,20 +58,20 @@ jobs:
               "platform-tools"
           sdkmanager --list_installed
 
-      - name: Set up Gradle (system install, no wrapper jar needed)
+      - name: Set up Gradle (system install, no wrapper jar)
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.4'
           cache-read-only: false
 
-      - name: Generate JS headers (prelude_js.h + bootstrap_js.h)
+      - name: Generate JS headers
         shell: bash
         run: |
           python3 --version
           python3 scripts/build_bootstrap.py
           ls -l app/src/main/jni/Generated/*.h
 
-      - name: Generate embedded_dex.h from Java sources
+      - name: Generate embedded_dex.h
         shell: bash
         continue-on-error: true
         run: |
@@ -166,28 +79,33 @@ jobs:
           ./scripts/build_dex.sh
           ls -l app/src/main/jni/Generated/embedded_dex.h
 
-      - name: Build Debug APK with system gradle
+      - name: Build only the shared library
         shell: bash
         run: |
           set -euo pipefail
-          gradle assembleDebug --stacktrace --no-daemon --console=plain
+          gradle :app:externalNativeBuildDebug --stacktrace --no-daemon --console=plain
 
-      - name: Locate APK
+      - name: Locate libyamgg.so
         if: success()
         shell: bash
         run: |
-          find app/build/outputs/apk -type f -name '*.apk' -print
+          set -euo pipefail
+          echo "Searching for libyamgg.so..."
+          find app/build -type f -name 'libyamgg.so' -print
+          echo ""
+          echo "All native libraries built:"
+          find app/build -type f -name '*.so' -print
 
-      - name: Upload APK artifact
+      - name: Upload .so artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: yam-jcore-debug-apk
+          name: yamgg-shared-library
           path: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/release/*.apk
-          if-no-files-found: warn
-          retention-days: 14
+            app/build/intermediates/cmake/debug/obj/arm64-v8a/libyamgg.so
+            app/build/intermediates/merged_native_libs/debug/out/lib/arm64-v8a/libyamgg.so
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload build reports on failure
         if: failure()

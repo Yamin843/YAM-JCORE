@@ -37,6 +37,12 @@ android {
                 // throughout the project.
                 cppFlags '-std=c++17 -fexceptions -frtti'
                 arguments '-DANDROID_STL=c++_shared'
+
+                // Build only the "yamgg" shared library target.
+                // This prevents Gradle from attempting to produce an
+                // APK and keeps the output focused on the .so file
+                // that the injector needs.
+                targets 'yamgg'
             }
         }
     }
