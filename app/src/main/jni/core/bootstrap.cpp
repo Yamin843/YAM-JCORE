@@ -11,6 +11,7 @@
 
 #include "Generated/prelude_js.h"
 #include "Generated/bootstrap_js.h"
+#include "art/intelligent_init.h"
 
 #define LOG_TAG "YAMGG"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
