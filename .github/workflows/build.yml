@@ -165,6 +165,14 @@ jobs:
           ls -lh "$SO"
           file "$SO"
           echo ""
+          echo "=== Size sanity ==="
+          SIZE_BYTES=$(stat -c%s "$SO")
+          SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+          echo "Size: ${SIZE_MB} MB"
+          if [ "$SIZE_MB" -gt 60 ]; then
+              echo "::warning::libyamgg.so is ${SIZE_MB} MB (expected < 40 MB after strip)"
+          fi
+          echo ""
           echo "=== JNI exports ==="
           nm -D "$SO" | grep -E 'JNI_OnLoad|JNI_OnUnload' || {
               echo "::error::JNI_OnLoad not exported"
@@ -173,6 +181,13 @@ jobs:
           echo ""
           echo "=== NEEDED libraries ==="
           readelf -d "$SO" | grep NEEDED || true
+          echo ""
+          if readelf -d "$SO" | grep -q 'libc++_shared.so'; then
+              echo "::error::libc++_shared.so is needed — c++_static failed"
+              exit 1
+          else
+              echo "✓ No libc++_shared dependency (c++_static works)"
+          fi
 
       - name: Upload libyamgg.so
         if: success()
