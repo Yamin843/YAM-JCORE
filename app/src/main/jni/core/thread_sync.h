@@ -51,6 +51,7 @@ public:
 private:
     void* interceptor_ = nullptr;
     Kind  kind_;
+    guint frida_thread_id_ = 0;
 };
 
 // RAII wrapper that preserves errno across a block, because ART and V8
@@ -97,7 +98,7 @@ public:
 private:
     UiThreadQueue() = default;
 
-    std::mutex                                    mu_;
+    mutable std::mutex                            mu_;
     std::queue<Task>                              q_;
     mutable std::atomic<size_t>                   dropped_count_{0};
 };

@@ -20,6 +20,11 @@ struct HeapMatch {
     std::string stringRep;            // instance.toString() as seen from JS
 };
 
+enum class ChooseStrategy {
+    Auto,    // use the bridge's Java.choose (bridge picks internal path)
+    Jvmti,   // use IterateOverInstancesOfClass + GetObjectsWithTags
+};
+
 class HeapScanner {
 public:
     using MatchCallback    = std::function<void(const HeapMatch&)>;
@@ -36,7 +41,8 @@ public:
                     MatchCallback onMatch,
                     CompleteCallback onComplete,
                     std::string& error,
-                    int timeout_ms = 3000);
+                    int timeout_ms = 3000,
+                    ChooseStrategy strategy = ChooseStrategy::Auto);
 
     // Cancel a running choose. The completion callback (if registered)
     // will fire with aborted=true. Returns true if a session was found.

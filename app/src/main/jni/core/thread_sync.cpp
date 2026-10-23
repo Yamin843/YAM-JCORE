@@ -16,14 +16,35 @@ namespace yamgg {
 // ═══════════════════════════════════════════════════════════════
 
 InterceptorIgnoreScope::InterceptorIgnoreScope(Kind kind) : kind_(kind) {
+    // Every scope, of every kind, suppresses the interceptor on the
+    // current thread. Without this, JNI calls made from inside our own
+    // instrumentation (e.g. during Java.perform's class loading) would
+    // recursively trigger our own hooks and crash.
     YamInterceptor* ic = yam_interceptor_obtain();
     if (ic != nullptr) {
         yam_interceptor_ignore_current_thread(ic);
         interceptor_ = ic;
     }
+
+    // Frida-thread scopes additionally hide the calling thread from
+    // /proc/self/task so that anti-cheat code that enumerates threads
+    // does not see our worker. Application-thread scopes must NOT do
+    // this: the app's main thread has to stay visible or the runtime
+    // itself breaks.
+    if (kind_ == Kind::Frida) {
+        guint tid = static_cast<guint>(yam_process_get_current_thread_id());
+        if (tid != 0) {
+            yam_cloak_add_thread(tid);
+            frida_thread_id_ = tid;
+        }
+    }
 }
 
 InterceptorIgnoreScope::~InterceptorIgnoreScope() {
+    if (kind_ == Kind::Frida && frida_thread_id_ != 0) {
+        yam_cloak_remove_thread(frida_thread_id_);
+        frida_thread_id_ = 0;
+    }
     if (interceptor_ != nullptr) {
         YamInterceptor* ic = static_cast<YamInterceptor*>(interceptor_);
         yam_interceptor_unignore_current_thread(ic);

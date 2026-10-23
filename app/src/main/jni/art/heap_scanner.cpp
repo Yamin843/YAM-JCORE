@@ -134,7 +134,8 @@ uint64_t HeapScanner::choose(const std::string& className,
                              MatchCallback onMatch,
                              CompleteCallback onComplete,
                              std::string& error,
-                             int timeout_ms) {
+                             int timeout_ms,
+                             ChooseStrategy strategy) {
     if (!ArtGuard::instance().is_bridge_available()) {
         error = "Java bridge unavailable";
         return 0;
@@ -158,9 +159,14 @@ uint64_t HeapScanner::choose(const std::string& className,
         g_reg.sessions[id] = sess;
     }
 
+    const char* command = "heap.choose";
+    if (strategy == ChooseStrategy::Jvmti) {
+        command = "heap.choose_jvmti";
+    }
+
     nlohmann::json args = {{"className", className}, {"sessionId", id}};
     nlohmann::json result;
-    if (!MessageRouter::instance().send_command("heap.choose",
+    if (!MessageRouter::instance().send_command(command,
                                                 args, result, error, timeout_ms)) {
         std::lock_guard<std::mutex> lk(g_reg.mu);
         g_reg.sessions.erase(id);
