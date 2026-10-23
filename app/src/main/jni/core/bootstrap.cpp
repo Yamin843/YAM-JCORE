@@ -25,7 +25,7 @@ struct BootstrapState {
     JavaVM*                vm = nullptr;
 
     YamScriptBackend*      backend       = nullptr;
-    YamScheduler*          sched         = nullptr;
+    YamScriptScheduler*    sched         = nullptr;
     GMainContext*          js_ctx        = nullptr;
     GMainLoop*             js_loop       = nullptr;
     GThread*               js_thread     = nullptr;
@@ -109,7 +109,7 @@ bool is_ready() {
 YamScriptBackend* backend()            { return g_boot.backend; }
 YamScript*        prelude_script()     { return g_boot.prelude; }
 YamScript*        bootstrap_script()   { return g_boot.bootstrap; }
-YamScheduler*     scheduler()          { return g_boot.sched; }
+YamScriptScheduler* scheduler()        { return g_boot.sched; }
 GMainContext*     js_context()         { return g_boot.js_ctx; }
 
 // ═══════════════════════════════════════════════════════════════
@@ -157,7 +157,7 @@ bool bootstrap_start(JavaVM* vm) {
     LOGI("bootstrap_start: backend=%p", static_cast<void*>(be));
 
     // ── Step 3: scheduler + js context ───────────────────────
-    g_boot.sched = yam_script_backend_get_scheduler(be);
+    g_boot.sched = yam_script_backend_get_scheduler();
     if (g_boot.sched == nullptr) {
         LOGE("bootstrap_start: no scheduler");
         g_boot.fatal_reason = "no scheduler";

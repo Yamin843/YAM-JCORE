@@ -22,7 +22,9 @@
 #define YAMGG_CORE_BOOTSTRAP_H
 
 #include <jni.h>
+
 #include <atomic>
+#include <string>
 
 // YAMJS.h exposes the renamed Gum + GumJS API (yam_* instead of gum_*).
 // It also transitively includes GLib (g_thread_new, GMainLoop, GBytes, …),
@@ -77,7 +79,7 @@ bool is_ready();
 YamScriptBackend* backend();
 YamScript*        prelude_script();
 YamScript*        bootstrap_script();
-YamScheduler*     scheduler();
+YamScriptScheduler* scheduler();
 GMainContext*     js_context();
 
 // Called by the message router when it has fully processed a "ready"
