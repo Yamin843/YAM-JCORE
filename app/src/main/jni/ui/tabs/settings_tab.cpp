@@ -4,6 +4,8 @@
 #include "art/art_guard.h"
 #include "bridge/handle_registry.h"
 #include "core/bootstrap.h"
+#include "core/message_router.h"
+#include "core/thread_sync.h"
 #include "core/error_recovery.h"
 #include "imgui.h"
 #include "ui/main_window.h"
@@ -21,9 +23,60 @@ void SettingsTab::draw() {
     ImGui::Separator();
     draw_capabilities_section();
     ImGui::Separator();
+    draw_deoptimize_section();
+    ImGui::Separator();
     draw_handles_section();
     ImGui::Separator();
     draw_ui_section();
+}
+
+void SettingsTab::draw_deoptimize_section() {
+    ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.30f, 1.0f), "ART Deoptimization");
+    ImGui::TextDisabled("Forces ART to abandon optimized code. "
+                        "Makes hooking reliable on modern Android.");
+
+    static std::string last_result;
+    static bool in_flight = false;
+
+    if (in_flight) {
+        ImGui::TextDisabled("working…");
+        return;
+    }
+
+    if (ImGui::Button("Deoptimize Everything")) {
+        in_flight = true;
+        last_result = "requested";
+        MessageRouter::instance().post_command(
+            "bridge.deoptimize.everything",
+            nlohmann::json::object(),
+            [](bool ok, const nlohmann::json& reply) {
+                marshal_to_ui([ok, reply]() {
+                    last_result = ok ? "ok" : reply.value("error", std::string("error"));
+                    in_flight = false;
+                });
+            });
+    }
+
+    ImGui::SameLine();
+
+    if (ImGui::Button("Deoptimize Boot Image")) {
+        in_flight = true;
+        last_result = "requested";
+        MessageRouter::instance().post_command(
+            "bridge.deoptimize.boot_image",
+            nlohmann::json::object(),
+            [](bool ok, const nlohmann::json& reply) {
+                marshal_to_ui([ok, reply]() {
+                    last_result = ok ? "ok" : reply.value("error", std::string("error"));
+                    in_flight = false;
+                });
+            });
+    }
+
+    if (!last_result.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("→ %s", last_result.c_str());
+    }
 }
 
 namespace {

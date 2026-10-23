@@ -23,6 +23,7 @@ private:
     SettingsTab() = default;
 
     void draw_session_section();
+    void draw_deoptimize_section();
     void draw_capabilities_section();
     void draw_handles_section();
     void draw_ui_section();
