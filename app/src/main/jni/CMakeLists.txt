@@ -216,7 +216,7 @@ target_link_libraries(yamgg PRIVATE
     "${LIBYAMJS_DIR}/libyamjs.a"
     -Wl,--no-whole-archive
     -Wl,--no-as-needed
-    c++_shared
+    c++_static
     -Wl,--as-needed
 )
 
