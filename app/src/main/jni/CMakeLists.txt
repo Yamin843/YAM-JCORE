@@ -149,8 +149,33 @@ find_library(EGL_LIB       EGL)
 find_library(GLES_LIB      GLESv3)
 find_library(DL_LIB        dl)
 find_library(Z_LIB         z)
-find_library(UNWIND_LIB    unwind)
-find_library(ATOMIC_LIB    atomic)
+
+# ── Optional: libunwind.a from the clang resource directory ──
+#
+# On aarch64, bionic (libc.so) already provides the _Unwind_* symbols
+# that V8 and libc++abi need. The NDK also ships a standalone
+# libunwind.a in the clang resource directory, but it is NOT in the
+# standard CMake library search path (find_library cannot locate it).
+#
+# We locate it explicitly if it exists, and link it only when found.
+# If it is absent, we link nothing extra: bionic provides what we need.
+#
+# libatomic is deliberately not searched: aarch64 has native atomic
+# instructions and NDK does not ship libatomic.a for this ABI.
+execute_process(
+    COMMAND "${CMAKE_C_COMPILER}" -print-resource-dir
+    OUTPUT_VARIABLE _clang_resource_dir
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+set(UNWIND_LIB "")
+if(EXISTS "${_clang_resource_dir}/lib/linux/aarch64/libunwind.a")
+    set(UNWIND_LIB "${_clang_resource_dir}/lib/linux/aarch64/libunwind.a")
+    message(STATUS "Using libunwind: ${UNWIND_LIB}")
+else()
+    message(STATUS "libunwind.a not found in clang resource dir; "
+                   "relying on bionic's built-in unwinder")
+endif()
 
 target_link_libraries(yamgg PRIVATE
     ${LOG_LIB}
@@ -159,10 +184,13 @@ target_link_libraries(yamgg PRIVATE
     ${GLES_LIB}
     ${DL_LIB}
     ${Z_LIB}
-    ${UNWIND_LIB}
-    ${ATOMIC_LIB}
     c++_shared
 )
+
+# Link libunwind only if we found it (see above).
+if(UNWIND_LIB)
+    target_link_libraries(yamgg PRIVATE "${UNWIND_LIB}")
+endif()
 
 # ─── LIBYAMJS static archive ──────────────────────────────────
 # --whole-archive is mandatory: without it the linker drops the
