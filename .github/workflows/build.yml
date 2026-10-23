@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 60
 
     env:
-      NDK_VERSION: '27.0.12077973'
+      NDK_VERSION: '27.3.13750724'
       ABI: 'arm64-v8a'
       API: '24'
 
@@ -49,6 +49,19 @@ jobs:
         uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools'
+
+      - name: Clean stale SDK/NDK caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          echo "Cleaning SDK root: $SDK_ROOT"
+          # احذف أي مجلد NDK جزئي أو تالف
+          rm -rf "$SDK_ROOT/ndk" || true
+          # احذف ملفات التنزيل المؤقتة
+          rm -rf "$SDK_ROOT/.temp" || true
+          rm -rf "$SDK_ROOT/.downloadIntermediates" || true
+          echo "Clean done."
 
       - name: Install SDK packages
         shell: bash
