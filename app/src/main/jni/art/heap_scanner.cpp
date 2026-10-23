@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 
 #include <android/log.h>
@@ -18,20 +19,63 @@ namespace art {
 
 namespace {
 
+// Session contains a std::atomic<bool> and is therefore non-copyable.
+// We store shared_ptr<Session> in the map instead of Session directly,
+// which makes both insertion and lookup cheap and copy-free.
 struct Session {
-    MatchCallback        on_match;
-    CompleteCallback     on_complete;
-    std::atomic<bool>    aborted{false};
+    HeapScanner::MatchCallback        on_match;
+    HeapScanner::CompleteCallback     on_complete;
+    std::shared_ptr<std::atomic<bool>> aborted;
 };
 
 struct Registry {
-    std::mutex                      mu;
-    std::map<uint64_t, Session>     sessions;
-    std::atomic<uint64_t>           next_id{1};
-    bool                            installed = false;
+    std::mutex                                    mu;
+    std::map<uint64_t, std::shared_ptr<Session>>  sessions;
+    std::atomic<uint64_t>                         next_id{1};
+    bool                                          installed = false;
 };
 
 Registry g_reg;
+
+void deliver_match(uint64_t session_id, const nlohmann::json& p) {
+    std::shared_ptr<Session> sess;
+    {
+        std::lock_guard<std::mutex> lk(g_reg.mu);
+        auto it = g_reg.sessions.find(session_id);
+        if (it == g_reg.sessions.end()) return;
+        sess = it->second;   // shared_ptr copy, cheap
+    }
+
+    if (!sess || !sess->on_match) return;
+    if (sess->aborted && sess->aborted->load(std::memory_order_acquire)) {
+        return;
+    }
+
+    HeapMatch m;
+    m.sessionId = session_id;
+    m.className = p.value("className", std::string());
+    m.handle    = p.value("handle",    std::string());
+    m.stringRep = p.value("toString",  std::string());
+
+    try { sess->on_match(m); } catch (...) {}
+}
+
+void deliver_complete(uint64_t session_id) {
+    std::shared_ptr<Session> sess;
+    {
+        std::lock_guard<std::mutex> lk(g_reg.mu);
+        auto it = g_reg.sessions.find(session_id);
+        if (it == g_reg.sessions.end()) return;
+        sess = it->second;
+        g_reg.sessions.erase(it);
+    }
+
+    if (!sess || !sess->on_complete) return;
+    bool was_aborted = sess->aborted &&
+                       sess->aborted->load(std::memory_order_acquire);
+
+    try { sess->on_complete(session_id, was_aborted); } catch (...) {}
+}
 
 void ensure_subscriptions() {
     if (g_reg.installed) return;
@@ -42,25 +86,7 @@ void ensure_subscriptions() {
             if (!msg.contains("payload")) return;
             const auto& p = msg["payload"];
             uint64_t session = p.value("sessionId", (uint64_t)0);
-            HeapMatch m;
-            m.sessionId   = session;
-            m.className   = p.value("className", std::string());
-            m.handle      = p.value("handle", std::string());
-            m.stringRep   = p.value("toString", std::string());
-
-            Session copy;
-            bool have = false;
-            {
-                std::lock_guard<std::mutex> lk(g_reg.mu);
-                auto it = g_reg.sessions.find(session);
-                if (it != g_reg.sessions.end()) {
-                    copy = it->second;
-                    have = true;
-                }
-            }
-            if (have && copy.on_match && !copy.aborted.load()) {
-                try { copy.on_match(m); } catch (...) {}
-            }
+            if (session != 0) deliver_match(session, p);
         });
 
     MessageRouter::instance().subscribe("heap.complete",
@@ -68,47 +94,15 @@ void ensure_subscriptions() {
             if (!msg.contains("payload")) return;
             const auto& p = msg["payload"];
             uint64_t session = p.value("sessionId", (uint64_t)0);
-
-            Session copy;
-            bool have = false;
-            {
-                std::lock_guard<std::mutex> lk(g_reg.mu);
-                auto it = g_reg.sessions.find(session);
-                if (it != g_reg.sessions.end()) {
-                    copy = it->second;
-                    have = true;
-                    g_reg.sessions.erase(it);
-                }
-            }
-            if (have && copy.on_complete) {
-                try { copy.on_complete(session, copy.aborted.load()); }
-                catch (...) {}
-            }
+            if (session != 0) deliver_complete(session);
         });
 
-    // "heap.visit_complete" fires for the visit_objects path; treat it
-    // identically to heap.complete.
     MessageRouter::instance().subscribe("heap.visit_complete",
         [](const nlohmann::json& msg) {
             if (!msg.contains("payload")) return;
             const auto& p = msg["payload"];
             uint64_t session = p.value("sessionId", (uint64_t)0);
-
-            Session copy;
-            bool have = false;
-            {
-                std::lock_guard<std::mutex> lk(g_reg.mu);
-                auto it = g_reg.sessions.find(session);
-                if (it != g_reg.sessions.end()) {
-                    copy = it->second;
-                    have = true;
-                    g_reg.sessions.erase(it);
-                }
-            }
-            if (have && copy.on_complete) {
-                try { copy.on_complete(session, copy.aborted.load()); }
-                catch (...) {}
-            }
+            if (session != 0) deliver_complete(session);
         });
 }
 
@@ -136,17 +130,21 @@ uint64_t HeapScanner::choose(const std::string& className,
     ensure_subscriptions();
 
     uint64_t id = g_reg.next_id.fetch_add(1, std::memory_order_relaxed);
+
+    auto sess = std::make_shared<Session>();
+    sess->on_match    = std::move(onMatch);
+    sess->on_complete = std::move(onComplete);
+    sess->aborted     = std::make_shared<std::atomic<bool>>(false);
+
     {
         std::lock_guard<std::mutex> lk(g_reg.mu);
-        g_reg.sessions[id] = Session{std::move(onMatch), std::move(onComplete), {false}};
+        g_reg.sessions[id] = sess;
     }
 
     nlohmann::json args = {{"className", className}, {"sessionId", id}};
     nlohmann::json result;
     if (!MessageRouter::instance().send_command("heap.choose",
                                                 args, result, error, timeout_ms)) {
-        // Roll back the registration. The completion callback will not
-        // fire, so callers must not expect one on failure.
         std::lock_guard<std::mutex> lk(g_reg.mu);
         g_reg.sessions.erase(id);
         return 0;
@@ -158,6 +156,7 @@ uint64_t HeapScanner::choose(const std::string& className,
         g_reg.sessions.erase(id);
         return 0;
     }
+
     return id;
 }
 
@@ -165,11 +164,9 @@ bool HeapScanner::cancel(uint64_t sessionId) {
     std::lock_guard<std::mutex> lk(g_reg.mu);
     auto it = g_reg.sessions.find(sessionId);
     if (it == g_reg.sessions.end()) return false;
-    it->second.aborted.store(true);
-    // Java.choose has no cancel; we simply stop delivering matches.
-    // The complete callback will still fire from JS when choose
-    // finishes naturally. That callback will see aborted=true and
-    // can report the cancellation to the user.
+    if (it->second && it->second->aborted) {
+        it->second->aborted->store(true, std::memory_order_release);
+    }
     return true;
 }
 
