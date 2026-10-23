@@ -44,6 +44,9 @@ LIB_ORDER = [
     "handle_ops",
     "convert_ops",
     "java_api",
+    "art_diagnostics",
+    "smart_init",
+    "class_router",
     "dispatcher",
 ]
 

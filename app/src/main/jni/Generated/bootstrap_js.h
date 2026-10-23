@@ -1840,6 +1840,424 @@ handlers["bridge.java.perform_deferred"] = function (args) {
 };
 
 // ═══════════════════════════════════════════════════════════════════
+//  lib/art_diagnostics.js
+// ═══════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  art_diagnostics.js — exhaustive libart / classloader inspection
+// ═══════════════════════════════════════════════════════════════════
+//
+// Called from the UI's Settings tab (or programmatically) to build a
+// full picture of the ART state. The result drives the operator's
+// decision when the bridge reports a failure: is this an app with its
+// own libart? Multiple libart? A renamed ART? A hidden symbol?
+
+handlers["art.diagnose"] = function () {
+    var report = {
+        libartCandidates:  [],
+        jvmModules:        [],
+        classLoaderCount:  0,
+        bridgeState:       globalThis.__yamgg_smart_init_state || "unknown",
+        apiLevel:          0
+    };
+
+    // 1. Find every module that looks like libart or libjvm.
+    try {
+        var modules = Process.enumerateModules();
+        for (var i = 0; i < modules.length; i++) {
+            var m = modules[i];
+            var isArt = /^lib(art|dvm)\.so$/.test(m.name);
+            var isJvm = /libjvm\.so$/.test(m.name);
+            var looksArt = /libart/i.test(m.name) ||
+                           (m.path && m.path.indexOf("/art/") !== -1);
+
+            if (isArt || isJvm || looksArt) {
+                var cand = {
+                    name:        m.name,
+                    path:        m.path,
+                    base:        m.base.toString(),
+                    size:        m.size,
+                    isArtExact:  isArt,
+                    isJvmExact:  isJvm,
+                    hasGetVMs:   false,
+                    hasArtSymbols: 0
+                };
+                try {
+                    if (m.findExportByName("JNI_GetCreatedJavaVMs")) {
+                        cand.hasGetVMs = true;
+                    }
+                } catch (e) {}
+                // Sample how many art:: symbols the module exports.
+                try {
+                    var exports = m.enumerateExports();
+                    for (var j = 0; j < exports.length; j++) {
+                        if (exports[j].name.indexOf("_ZN3art") === 0) {
+                            cand.hasArtSymbols++;
+                            if (cand.hasArtSymbols >= 20) break;
+                        }
+                    }
+                } catch (e) {}
+
+                if (isArt)          report.libartCandidates.push(cand);
+                else if (isJvm)     report.jvmModules.push(cand);
+                else                report.libartCandidates.push(cand);
+            }
+        }
+    } catch (e) {
+        report.enumerateError = String(e && e.message);
+    }
+
+    // 2. Count class loaders, if the bridge is available.
+    if (globalThis.Java && Java.available) {
+        try {
+            report.apiLevel = Java.androidVersion;
+            Java.performNow(function () {
+                Java.enumerateClassLoaders({
+                    onMatch: function (l) { report.classLoaderCount++; },
+                    onComplete: function () {}
+                });
+            });
+        } catch (e) {
+            report.javaError = String(e && e.message);
+        }
+    }
+
+    return report;
+};
+
+// Diagnostic: list every loaded class from every loader.
+handlers["art.classes_from_all_loaders"] = function (args) {
+    if (!globalThis.Java || !Java.available) {
+        throw new Error("Java bridge unavailable");
+    }
+    var filter = (args && args.filter) || "";
+    var result = { loaders: [], totalClasses: 0 };
+
+    Java.performNow(function () {
+        var seen = {};
+        Java.enumerateClassLoaders({
+            onMatch: function (loader) {
+                var entry = {
+                    description: String(loader),
+                    classes: []
+                };
+                try {
+                    var factory = Java.ClassFactory.get(loader);
+                    // We cannot enumerate a factory's classes directly,
+                    // but we can test whether known classes load
+                    // through it. Callers use this to find which
+                    // loader owns a given class.
+                } catch (e) {
+                    entry.error = String(e && e.message);
+                }
+                result.loaders.push(entry);
+            },
+            onComplete: function () {}
+        });
+    });
+
+    // Also enumerate classes globally (union of all loaders).
+    var allClasses = [];
+    try {
+        Java.enumerateLoadedClasses({
+            onMatch: function (name) {
+                if (!filter || name.indexOf(filter) !== -1) {
+                    allClasses.push(name);
+                }
+            },
+            onComplete: function () {}
+        });
+    } catch (e) {}
+    result.totalClasses = allClasses.length;
+    result.classes = allClasses.slice(0, 5000);   // avoid huge payloads
+    result.truncated = allClasses.length > 5000;
+
+    return result;
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  lib/smart_init.js
+// ═══════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  smart_init.js — prevent bridge initialization before libart exists
+// ═══════════════════════════════════════════════════════════════════
+//
+// The bridge caches its "Java.available" answer on first read. If the
+// first read happens before libart.so is loaded (late app startup,
+// embedded ART, etc.), the bridge fails permanently. This module runs
+// BEFORE any code that touches Java.available, polls libart using
+// Gum APIs only, and only then triggers bridge initialization.
+//
+// The decision loop:
+//   1. Poll Process.enumerateModules() every 200 ms (Gum-only, safe).
+//   2. When a module matches /lib(art|dvm)\.so$/, probe it for
+//      JNI_GetCreatedJavaVMs (present in every ART build).
+//   3. If the probe succeeds, read Java.available (which now
+//      succeeds and caches correctly).
+//   4. Otherwise, report a precise failure reason.
+
+(function installSmartInit() {
+
+    globalThis.__yamgg_smart_init_state = "pending";
+    globalThis.__yamgg_smart_init_info = null;
+
+    function findLibartCandidates() {
+        var candidates = [];
+        try {
+            var modules = Process.enumerateModules();
+            for (var i = 0; i < modules.length; i++) {
+                var m = modules[i];
+                if (/^lib(art|dvm)\.so$/.test(m.name)) {
+                    candidates.push(m);
+                } else if (m.path && (
+                        m.path.indexOf("/art/") !== -1 ||
+                        m.path.indexOf("libart") !== -1)) {
+                    if (/lib(art|dvm)[^/]*\.so$/.test(m.name)) {
+                        candidates.push(m);
+                    }
+                }
+            }
+        } catch (e) {}
+        return candidates;
+    }
+
+    function probeCandidate(m) {
+        // A usable libart must export JNI_GetCreatedJavaVMs. Everything
+        // else (ART internals) may or may not exist depending on the
+        // build; the bridge already handles those gracefully.
+        try {
+            var sym = m.findExportByName("JNI_GetCreatedJavaVMs");
+            if (sym) return { ok: true, symbol: sym };
+        } catch (e) {}
+        // Fallback: try the global lookup.
+        try {
+            var sym2 = Module.findGlobalExportByName("JNI_GetCreatedJavaVMs");
+            if (sym2) return { ok: true, symbol: sym2 };
+        } catch (e) {}
+        return { ok: false };
+    }
+
+    function tryBridge() {
+        try {
+            var info = globalThis.__yamgg_bridge_ready__();
+            return { ok: !!(info && info.available), info: info };
+        } catch (e) {
+            return { ok: false, error: String((e && e.message) || e) };
+        }
+    }
+
+    globalThis.handlers = globalThis.handlers || {};
+    handlers["smart_init.start"] = function (args) {
+        var timeoutMs   = (args && args.timeoutMs) || 30000;
+        var intervalMs  = (args && args.intervalMs) || 200;
+        var started     = Date.now();
+        var found       = [];
+
+        function attempt() {
+            if (globalThis.__yamgg_smart_init_state !== "pending") {
+                return;   // already resolved
+            }
+
+            var candidates = findLibartCandidates();
+
+            // Diagnostic: record every candidate we have ever seen.
+            for (var i = 0; i < candidates.length; i++) {
+                var path = candidates[i].path;
+                var already = false;
+                for (var j = 0; j < found.length; j++) {
+                    if (found[j].path === path) { already = true; break; }
+                }
+                if (!already) {
+                    found.push({ path: path, name: candidates[i].name });
+                    send({ type: "event", name: "smart_init.candidate",
+                           payload: { path: path, name: candidates[i].name } });
+                }
+            }
+
+            for (var k = 0; k < candidates.length; k++) {
+                var cand = candidates[k];
+                var probe = probeCandidate(cand);
+                if (probe.ok) {
+                    var bridge = tryBridge();
+                    if (bridge.ok) {
+                        globalThis.__yamgg_smart_init_state = "ready";
+                        globalThis.__yamgg_smart_init_info = {
+                            mode: "full",
+                            libartPath: cand.path,
+                            libartName: cand.name,
+                            candidateCount: candidates.length,
+                            elapsedMs: Date.now() - started
+                        };
+                        send({ type: "event", name: "smart_init.ready",
+                               payload: globalThis.__yamgg_smart_init_info });
+                        return;
+                    }
+                    // libart valid but bridge failed. Record and give
+                    // the bridge one more chance (in case the failure
+                    // was transient). But since the bridge caches, we
+                    // cannot force a retry — we just report the error.
+                    globalThis.__yamgg_smart_init_state = "failed";
+                    globalThis.__yamgg_smart_init_info = {
+                        mode: "jni_only_fallback",
+                        reason: "bridge_init_failed",
+                        error: bridge.error || "available=false",
+                        libartPath: cand.path,
+                        libartName: cand.name
+                    };
+                    send({ type: "event", name: "smart_init.failed",
+                           payload: globalThis.__yamgg_smart_init_info });
+                    return;
+                }
+            }
+
+            if (Date.now() - started >= timeoutMs) {
+                globalThis.__yamgg_smart_init_state = "failed";
+                globalThis.__yamgg_smart_init_info = {
+                    mode: "dead",
+                    reason: candidates.length === 0
+                        ? "no_libart_module_found"
+                        : "libart_found_but_no_JNI_GetCreatedJavaVMs",
+                    elapsedMs: Date.now() - started,
+                    candidates: found
+                };
+                send({ type: "event", name: "smart_init.failed",
+                       payload: globalThis.__yamgg_smart_init_info });
+                return;
+            }
+
+            setTimeout(attempt, intervalMs);
+        }
+
+        // Kick off asynchronously so the script's synchronous tail
+        // can finish loading the rest of the handlers.
+        setTimeout(attempt, 10);
+        return { started: true };
+    };
+
+    // Diagnostic handler, callable from the UI.
+    handlers["smart_init.status"] = function () {
+        return {
+            state: globalThis.__yamgg_smart_init_state,
+            info:  globalThis.__yamgg_smart_init_info
+        };
+    };
+
+})();
+
+// ═══════════════════════════════════════════════════════════════════
+//  lib/class_router.js
+// ═══════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  class_router.js — resolve a class through any available loader
+// ═══════════════════════════════════════════════════════════════════
+//
+// The default Java.use(className) tries only the boot classpath. When
+// an app has plugin-style classes loaded by a custom ClassLoader, the
+// default lookup fails. This handler tries each loader in turn and
+// returns the one that succeeds, together with the loader handle so
+// the UI can bind subsequent operations to the same scope.
+
+var g_class_loader_cache = {};   // className → { handle, description }
+
+handlers["class.resolve"] = function (args) {
+    if (!args || !args.className) throw new Error("className required");
+    if (!globalThis.Java || !Java.available) {
+        throw new Error("Java bridge unavailable");
+    }
+
+    var className = args.className;
+
+    // Fast path: default loader works.
+    try {
+        var defaultClass = Java.use(className);
+        return {
+            ok:          true,
+            className:   className,
+            loader:      null,
+            loaderDesc:  "<default>",
+            viaDefault:  true
+        };
+    } catch (e) {
+        // fall through
+    }
+
+    // Cache hit for a non-default loader.
+    var cached = g_class_loader_cache[className];
+    if (cached) {
+        try {
+            var loader = Java.cast(ptr(cached.handle), Java.use("java.lang.ClassLoader"));
+            var factory = Java.ClassFactory.get(loader);
+            factory.use(className);
+            return {
+                ok:         true,
+                className:  className,
+                loader:     cached.handle,
+                loaderDesc: cached.description,
+                viaDefault: false,
+                cached:     true
+            };
+        } catch (e) {
+            delete g_class_loader_cache[className];
+        }
+    }
+
+    // Try every loader.
+    var loaders = [];
+    try {
+        Java.performNow(function () {
+            Java.enumerateClassLoaders({
+                onMatch: function (l) {
+                    try {
+                        var handle = Java.retain(l).$h.toString();
+                        loaders.push({ handle: handle, loader: l });
+                    } catch (e) {}
+                },
+                onComplete: function () {}
+            });
+        });
+    } catch (e) {
+        throw new Error("could not enumerate class loaders: " + String(e && e.message));
+    }
+
+    for (var i = 0; i < loaders.length; i++) {
+        try {
+            var factory = Java.ClassFactory.get(loaders[i].loader);
+            factory.use(className);
+            g_class_loader_cache[className] = {
+                handle:      loaders[i].handle,
+                description: String(loaders[i].loader)
+            };
+            return {
+                ok:         true,
+                className:  className,
+                loader:     loaders[i].handle,
+                loaderDesc: String(loaders[i].loader),
+                viaDefault: false,
+                cached:     false,
+                totalLoadersTried: loaders.length
+            };
+        } catch (e) {
+            // try next loader
+        }
+    }
+
+    throw new Error(
+        "class not found in any loader: " + className +
+        " (tried " + loaders.length + " loaders)");
+};
+
+// Invalidate the cache when the caller switches to a different target.
+handlers["class.resolve.clear_cache"] = function () {
+    g_class_loader_cache = {};
+    return { ok: true };
+};
+
+// ═══════════════════════════════════════════════════════════════════
 //  lib/dispatcher.js
 // ═══════════════════════════════════════════════════════════════════
 
