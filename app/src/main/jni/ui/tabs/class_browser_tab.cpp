@@ -163,8 +163,10 @@ void ClassBrowserTab::draw() {
 
     // ── Top toolbar ──
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 120.0f);
-    ImGui::InputTextWithHint("##filter", "Filter classes…", filter_buf_,
-                             sizeof(filter_buf_));
+    ImGui::InputTextWithHint(
+        "##filter",
+        "Filter: substring, wildcard (*Bundle*), or regex (/^android\\./i)",
+        filter_buf_, sizeof(filter_buf_));
     ImGui::SameLine();
     if (ImGui::Button("Refresh") && !list_.loading) {
         refresh_list();

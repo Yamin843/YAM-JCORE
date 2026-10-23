@@ -276,9 +276,21 @@ bool is_map_kind(JavaKind k) {
 JavaKind TypeConverter::classify(const std::string& t) {
     if (t.empty()) return JavaKind::Unknown;
 
+    // Strip generic arguments: "java.util.List<java.lang.String>"
+    // becomes "java.util.List" before classification.
+    std::string base = t;
+    auto lt = base.find('<');
+    if (lt != std::string::npos) {
+        base = base.substr(0, lt);
+        // Trim trailing whitespace.
+        while (!base.empty() && (base.back() == ' ' || base.back() == '\t')) {
+            base.pop_back();
+        }
+    }
+
     // Exact match first.
     auto& m = exact_map();
-    auto it = m.find(t);
+    auto it = m.find(base);
     if (it != m.end()) return it->second;
 
     // Array notation without exact match: check prefix heuristics.

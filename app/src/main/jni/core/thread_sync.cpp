@@ -51,7 +51,23 @@ UiThreadQueue& UiThreadQueue::instance() {
 void UiThreadQueue::post(Task task) {
     if (!task) return;
     std::lock_guard<std::mutex> lk(mu_);
+    if (q_.size() >= kMaxQueueSize) {
+        // Drop the oldest task to make room. This is the correct
+        // policy for progress-style events: the newest is always the
+        // most relevant.
+        q_.pop();
+        dropped_count_.fetch_add(1, std::memory_order_relaxed);
+    }
     q_.push(std::move(task));
+}
+
+size_t UiThreadQueue::queue_size() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return q_.size();
+}
+
+size_t UiThreadQueue::dropped_count() const {
+    return dropped_count_.load(std::memory_order_relaxed);
 }
 
 void UiThreadQueue::drain() {

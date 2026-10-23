@@ -104,6 +104,23 @@ void ensure_subscriptions() {
             uint64_t session = p.value("sessionId", (uint64_t)0);
             if (session != 0) deliver_complete(session);
         });
+
+    // Progress events are logged to logcat but not delivered to
+    // callbacks (the callback signatures are Match and Complete only).
+    // Future: extend HeapScanner with a ProgressCallback.
+    MessageRouter::instance().subscribe("heap.progress",
+        [](const nlohmann::json& msg) {
+            if (!msg.contains("payload")) return;
+            const auto& p = msg["payload"];
+            uint64_t session = p.value("sessionId", (uint64_t)0);
+            uint64_t matches = p.value("matches", (uint64_t)0);
+            uint64_t elapsed = p.value("elapsedMs", (uint64_t)0);
+            __android_log_print(ANDROID_LOG_DEBUG, "YAMGG",
+                "heap.progress session=%llu matches=%llu elapsed=%llums",
+                (unsigned long long)session,
+                (unsigned long long)matches,
+                (unsigned long long)elapsed);
+        });
 }
 
 } // namespace

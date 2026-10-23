@@ -20,6 +20,144 @@ static const char kSource[] = R"YAMJS_BOOTSTRAP(
 
 var handlers = {};
 
+
+// ═══════════════════════════════════════════════════════════════════
+//  Generic-aware collection and map construction
+// ═══════════════════════════════════════════════════════════════════
+//
+// Java generics are erased at runtime. To build a value that satisfies
+// a method expecting e.g. List<String>, the JS side must know the
+// element type. We get it from a `genericTypes` hint that the C++ side
+// extracts from the method's declared parameter types via reflection
+// (see bridge/class_browser.cpp). The hint is a string like
+// "java.util.List<java.lang.String>" or "java.util.Map<K,V>".
+
+function parseGenericArgs(typeName) {
+    // "java.util.Map<K, V>" → ["K", "V"]
+    // "java.util.List<String>" → ["String"]
+    // "java.util.List" → []
+    var lt = typeName.indexOf("<");
+    if (lt === -1) return { base: typeName.trim(), args: [] };
+    var base = typeName.substring(0, lt).trim();
+    // Handle nested generics by counting angle brackets.
+    var depth = 0;
+    var start = lt + 1;
+    var args = [];
+    for (var i = lt; i < typeName.length; i++) {
+        var c = typeName.charAt(i);
+        if (c === "<") { depth++; continue; }
+        if (c === ">") {
+            depth--;
+            if (depth === 0) {
+                args.push(typeName.substring(start, i).trim());
+                break;
+            }
+            continue;
+        }
+        if (c === "," && depth === 1) {
+            args.push(typeName.substring(start, i).trim());
+            start = i + 1;
+        }
+    }
+    return { base: base, args: args };
+}
+
+function buildTypedCollection(elements, baseType, argTypes) {
+    // Choose concrete class from baseType.
+    var concrete = baseType;
+    if (baseType === "java.util.Collection" ||
+        baseType === "java.util.List" ||
+        baseType === "java.util.Queue" ||
+        baseType === "java.util.Deque") {
+        concrete = "java.util.ArrayList";
+    } else if (baseType === "java.util.Set" ||
+               baseType === "java.util.SortedSet" ||
+               baseType === "java.util.NavigableSet") {
+        concrete = "java.util.LinkedHashSet";
+    } else if (baseType === "java.util.SortedMap" ||
+               baseType === "java.util.NavigableMap") {
+        concrete = "java.util.TreeMap";
+    }
+
+    var C = Java.use(concrete);
+    var result = C.$new();
+
+    // If no element type is known, fall back to raw insertion.
+    if (!argTypes || argTypes.length === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            result.add(toJavaForCollection(elements[i], null, null));
+        }
+        return result;
+    }
+
+    var elemType = argTypes[0];
+    var parsedElem = parseGenericArgs(elemType);
+
+    for (var j = 0; j < elements.length; j++) {
+        var converted = toJavaForCollection(elements[j], parsedElem.base, parsedElem.args);
+        result.add(converted);
+    }
+    return result;
+}
+
+function buildTypedMap(entries, baseType, argTypes) {
+    var concrete = baseType;
+    if (baseType === "java.util.Map" ||
+        baseType === "java.util.SortedMap" ||
+        baseType === "java.util.NavigableMap") {
+        concrete = "java.util.LinkedHashMap";
+    }
+
+    var C = Java.use(concrete);
+    var result = C.$new();
+
+    if (!argTypes || argTypes.length < 2) {
+        for (var key in entries) {
+            if (!entries.hasOwnProperty(key)) continue;
+            result.put(key, toJavaForCollection(entries[key], null, null));
+        }
+        return result;
+    }
+
+    var keyType   = parseGenericArgs(argTypes[0]);
+    var valueType = parseGenericArgs(argTypes[1]);
+
+    for (var k in entries) {
+        if (!entries.hasOwnProperty(k)) continue;
+        var convertedKey   = toJavaForCollection(k, keyType.base, keyType.args);
+        var convertedValue = toJavaForCollection(entries[k], valueType.base, valueType.args);
+        result.put(convertedKey, convertedValue);
+    }
+    return result;
+}
+
+// Helper for collection/map element conversion. Falls back to the
+// existing fromJsonForJava for primitive types and Java objects.
+function toJavaForCollection(value, baseType, argTypes) {
+    if (value === null || value === undefined) return null;
+
+    // Recurse into nested collections.
+    if (baseType === "java.util.List" ||
+        baseType === "java.util.ArrayList" ||
+        baseType === "java.util.Collection" ||
+        baseType === "java.util.Set") {
+        if (!Array.isArray(value)) return fromJsonForJava(value, baseType, Java.vm.getEnv());
+        return buildTypedCollection(value, baseType, argTypes);
+    }
+
+    if (baseType === "java.util.Map" ||
+        baseType === "java.util.HashMap" ||
+        baseType === "java.util.LinkedHashMap") {
+        if (typeof value !== "object" || Array.isArray(value)) {
+            return fromJsonForJava(value, baseType, Java.vm.getEnv());
+        }
+        return buildTypedMap(value, baseType, argTypes);
+    }
+
+    // Primitive or simple type.
+    return fromJsonForJava(value, baseType, Java.vm.getEnv());
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  lib/send_auto.js
 // ═══════════════════════════════════════════════════════════════════
@@ -425,22 +563,38 @@ handlers["heap.choose"] = function (args) {
     if (!bridgeInfo.available) throw new Error("bridge unavailable");
     var className = args.className;
     var sessionId = args.sessionId;
+    var startedAt = Date.now();
+    var matchCount = 0;
+    var PROGRESS_INTERVAL = 500;
+
+    // Emit a progress event every 500 matches so the UI can display
+    // "scanned 1500, elapsed 2.3s" instead of hanging silently.
     Java.performNow(function () {
         Java.choose(className, {
             onMatch: function (instance) {
+                matchCount++;
                 var handle = null;
                 try { handle = retainObject(instance, className); } catch (_) {}
                 send({ type: "event", name: "heap.match",
                        payload: { sessionId: sessionId, className: className,
                                   handle: handle, toString: safeString(instance) } });
+                if (matchCount % PROGRESS_INTERVAL === 0) {
+                    send({ type: "event", name: "heap.progress",
+                           payload: { sessionId: sessionId,
+                                      className: className,
+                                      matches: matchCount,
+                                      elapsedMs: Date.now() - startedAt } });
+                }
             },
             onComplete: function () {
                 send({ type: "event", name: "heap.complete",
-                       payload: { sessionId: sessionId, className: className } });
+                       payload: { sessionId: sessionId, className: className,
+                                  matches: matchCount,
+                                  elapsedMs: Date.now() - startedAt } });
             }
         });
     });
-    return { started: true, sessionId: sessionId };
+    return { started: true, sessionId: sessionId, className: className };
 };
 
 handlers["heap.visit_objects"] = function (args) {
@@ -531,63 +685,124 @@ handlers["backtrace.capture"] = function (args) {
 
 handlers["backtrace.capture_thread"] = function (args) {
     if (!bridgeInfo.available) throw new Error("bridge unavailable");
-    if (typeof args.threadId !== "number") throw new Error("threadId required");
-    var api = Java.api;
-    if (!api || !api["art::StackVisitor::StackVisitor"]) {
-        throw new Error("StackVisitor unavailable in bridge API");
+    if (!args || typeof args.threadId !== "number") {
+        throw new Error("threadId required");
     }
-    var limit = args.limit || 32;
+    var threadId = args.threadId;
+    var limit = args.limit || 64;
+
+    // Java.backtrace() only walks the current thread. For an arbitrary
+    // thread, the bridge does not expose a Java-stack walker. Instead,
+    // we return a **native** stack trace of the specified thread via
+    // Thread.backtrace, which is what the Java stack ultimately rests
+    // on. Symbolized frames are returned as an array of objects.
+
+    var thread = null;
+    try {
+        thread = Process.findThreadById(threadId);
+    } catch (e) {
+        thread = null;
+    }
+    if (thread === null) {
+        throw new Error("thread " + threadId + " not found");
+    }
+
+    var ctx = null;
+    try {
+        ctx = thread.context;
+    } catch (e) {
+        ctx = null;
+    }
+
+    var addrs = [];
+    try {
+        addrs = Thread.backtrace(ctx, Backtracer.ACCURATE).slice(0, limit);
+    } catch (e) {
+        throw new Error("backtrace failed: " + (e && e.message));
+    }
+
     var frames = [];
-    Java.performNow(function () {
-        var env = Java.vm.getEnv();
-        var thread = api["art::Thread::CurrentFromGdb"]();
-        if (!thread || thread.isNull()) throw new Error("cannot get current thread");
-        // The bridge exposes ArtStackVisitor as a class API.
-        // We instantiate it via the C++-backed constructor and walk.
-        var StackVisitor = Java.api && Java.api.ArtStackVisitor;
-        if (!StackVisitor) {
-            // Fallback: use the current thread's backtrace.
-            var bt = Java.backtrace({ limit: limit });
-            if (bt && bt.frames) {
-                for (var i = 0; i < bt.frames.length; i++) {
-                    var f = bt.frames[i];
-                    frames.push({
-                        signature: f.signature || null,
-                        className: f.className || null,
-                        methodName: f.methodName || null,
-                        origin: f.origin || null,
-                        fileName: f.fileName || null,
-                        lineNumber: f.lineNumber !== undefined ? f.lineNumber : -1,
-                        methodFlags: f.methodFlags || 0
-                    });
-                }
-            }
-            return;
-        }
-        // When the bridge exposes ArtStackVisitor, use it.
-        try {
-            var visitor = new StackVisitor(thread, null, "skip-inlined-frames", 0, false);
-            visitor.walkStack(false);
-            frames.push({ note: "walked via ArtStackVisitor" });
-        } catch (e) {
-            frames.push({ error: safeString(e) });
-        }
-    });
-    return { frames: frames };
-};
+    for (var i = 0; i < addrs.length; i++) {
+        var sym = null;
+        try { sym = DebugSymbol.fromAddress(addrs[i]); } catch (e) {}
+        var frame = {
+            index: i,
+            address: addrs[i].toString(),
+            module:   sym && sym.moduleName ? sym.moduleName : null,
+            symbol:   sym && sym.name       ? sym.name       : null,
+            offset:   sym && sym.name && sym.moduleName
+                ? addrs[i].sub(Process.getModuleByName(sym.moduleName).base).toString()
+                : null
+        };
+        frames.push(frame);
+    }
+
+    return {
+        frames: frames,
+        kind: "native",
+        note: "Thread.backtrace; Java stack of a non-current thread is not exposed by the bridge"
+    };
+};;
 
 // ═══════════════════════════════════════════════════════════════════
 //  lib/class_ops.js
 // ═══════════════════════════════════════════════════════════════════
 
+// Advanced filter matcher. Supports three modes:
+//
+//   substring        "Bundle"          → name.indexOf("Bundle") !== -1
+//   wildcard         "*Bundle*"        → regex with * and ? escaped
+//   regex            "/^android\./i"  → full regex
+//
+// The mode is chosen from the input:
+//   - starts with '/' and has a closing '/' → regex (with flags after)
+//   - contains '*' or '?'                   → wildcard
+//   - otherwise                             → substring
+function compileFilter(filter) {
+    if (!filter) return null;
+
+    // Regex mode.
+    if (filter.length >= 3 && filter[0] === '/') {
+        var lastSlash = filter.lastIndexOf('/');
+        if (lastSlash > 0) {
+            var pattern = filter.substring(1, lastSlash);
+            var flags   = filter.substring(lastSlash + 1);
+            try {
+                var re = new RegExp(pattern, flags);
+                return function (name) { return re.test(name); };
+            } catch (e) {
+                // Invalid regex; fall back to substring.
+                return function (name) { return name.indexOf(filter) !== -1; };
+            }
+        }
+    }
+
+    // Wildcard mode.
+    if (filter.indexOf('*') !== -1 || filter.indexOf('?') !== -1) {
+        var escaped = filter.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+        var pattern = escaped.replace(/\*/g, '.*').replace(/\?/g, '.');
+        try {
+            var re2 = new RegExp('^' + pattern + '$');
+            return function (name) { return re2.test(name); };
+        } catch (e) {
+            return function (name) { return name.indexOf(filter) !== -1; };
+        }
+    }
+
+    // Substring mode.
+    var needle = filter;
+    return function (name) { return name.indexOf(needle) !== -1; };
+}
+
 handlers["bridge.class.list"] = function (args) {
     if (!bridgeInfo.available) throw new Error("bridge unavailable");
     var filter = args && args.filter ? String(args.filter) : null;
+    var matcher = compileFilter(filter);
     var classes = [];
     Java.performNow(function () {
         Java.enumerateLoadedClasses({
             onMatch: function (name) {
-                if (!filter || name.indexOf(filter) !== -1) classes.push(name);
+                if (!matcher || matcher(name)) classes.push(name);
             },
             onComplete: function () {}
         });

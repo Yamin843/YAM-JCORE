@@ -18,6 +18,7 @@
 #ifndef YAMGG_CORE_THREAD_SYNC_H
 #define YAMGG_CORE_THREAD_SYNC_H
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -75,8 +76,19 @@ public:
 
     using Task = std::function<void()>;
 
-    // Called by any thread. Enqueues and returns immediately.
+    // Maximum number of pending tasks. When the queue is full, the
+    // oldest task is dropped to make room for the new one. This
+    // prevents runaway memory growth when JS floods the UI thread
+    // with results (e.g. tens of thousands of heap matches).
+    static constexpr size_t kMaxQueueSize = 10000;
+
+    // Called by any thread. Enqueues and returns immediately. If the
+    // queue is full, the oldest task is discarded.
     void post(Task task);
+
+    // Statistics for the UI to display.
+    size_t queue_size() const;
+    size_t dropped_count() const;
 
     // Called by the UI thread once per frame. Executes all queued tasks
     // in FIFO order.
@@ -85,8 +97,9 @@ public:
 private:
     UiThreadQueue() = default;
 
-    std::mutex        mu_;
-    std::queue<Task>  q_;
+    std::mutex                                    mu_;
+    std::queue<Task>                              q_;
+    mutable std::atomic<size_t>                   dropped_count_{0};
 };
 
 // Convenience: schedule a JS reply callback to run on the UI thread.

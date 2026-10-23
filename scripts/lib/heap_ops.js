@@ -4,22 +4,38 @@ handlers["heap.choose"] = function (args) {
     if (!bridgeInfo.available) throw new Error("bridge unavailable");
     var className = args.className;
     var sessionId = args.sessionId;
+    var startedAt = Date.now();
+    var matchCount = 0;
+    var PROGRESS_INTERVAL = 500;
+
+    // Emit a progress event every 500 matches so the UI can display
+    // "scanned 1500, elapsed 2.3s" instead of hanging silently.
     Java.performNow(function () {
         Java.choose(className, {
             onMatch: function (instance) {
+                matchCount++;
                 var handle = null;
                 try { handle = retainObject(instance, className); } catch (_) {}
                 send({ type: "event", name: "heap.match",
                        payload: { sessionId: sessionId, className: className,
                                   handle: handle, toString: safeString(instance) } });
+                if (matchCount % PROGRESS_INTERVAL === 0) {
+                    send({ type: "event", name: "heap.progress",
+                           payload: { sessionId: sessionId,
+                                      className: className,
+                                      matches: matchCount,
+                                      elapsedMs: Date.now() - startedAt } });
+                }
             },
             onComplete: function () {
                 send({ type: "event", name: "heap.complete",
-                       payload: { sessionId: sessionId, className: className } });
+                       payload: { sessionId: sessionId, className: className,
+                                  matches: matchCount,
+                                  elapsedMs: Date.now() - startedAt } });
             }
         });
     });
-    return { started: true, sessionId: sessionId };
+    return { started: true, sessionId: sessionId, className: className };
 };
 
 handlers["heap.visit_objects"] = function (args) {
